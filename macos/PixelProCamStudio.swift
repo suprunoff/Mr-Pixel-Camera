@@ -107,6 +107,16 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     @Published var currentCameraFacing: String = "1x 24mm f/1.68"
     @Published var isHQMode: Bool = true
     @Published var is60FpsMode: Bool = true
+    @Published var selectedResolution: String = "1080p" // "1080p", "720p", "480p", "360p"
+
+    var captureDims: (w: Int, h: Int) {
+        switch selectedResolution {
+        case "720p": return (1280, 720)
+        case "480p": return (640, 480)
+        case "360p": return (640, 360)
+        default: return (1920, 1080)
+        }
+    }
 
     // Physical Lens & Prime Focal Length Selection
     @Published var selectedPhysicalLens: String = "1x"
@@ -584,17 +594,18 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         let filename = "MrPixelCamera_Photo_\(df.string(from: Date())).png"
         let fullPath = "\(capturesDir)/\(filename)"
 
+        let dims = captureDims
         sendOBSRequest(type: "SaveSourceScreenshot", data: [
             "sourceName": "Сцена",
             "imageFormat": "png",
             "imageFilePath": fullPath,
-            "imageWidth": 1920,
-            "imageHeight": 1080
+            "imageWidth": dims.w,
+            "imageHeight": dims.h
         ], id: "save_photo")
 
         NSSound(named: NSSound.Name("Tink"))?.play()
-        lastCaptureMessage = tr("📸 Сохранено: \(filename)", "📸 Saved: \(filename)")
-        FileLogger.shared.log("PHOTO", "Saved 1920x1080 studio snapshot to \(fullPath)")
+        lastCaptureMessage = tr("📸 Сохранено (\(dims.w)×\(dims.h)): \(filename)", "📸 Saved (\(dims.w)×\(dims.h)): \(filename)")
+        FileLogger.shared.log("PHOTO", "Saved \(dims.w)x\(dims.h) studio snapshot to \(fullPath)")
     }
 
     func toggleStudioRecording() {
@@ -728,19 +739,31 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         }
     }
 
-    // MARK: - Switch UVC Capture & OBS Canvas FPS Mode
+    // MARK: - Switch UVC Capture Resolution & OBS Output Format
+    func setCameraResolution(_ res: String) {
+        selectedResolution = res
+        applyVideoPipelineSettings()
+    }
+
     func setCameraFpsMode(use60Fps: Bool) {
         is60FpsMode = use60Fps
-        let num = use60Fps ? 60000240 : 30000030
-        let targetCanvasFps = use60Fps ? 60 : 30
         rodeLipSyncMs = use60Fps ? 35.0 : 65.0
+        applyVideoPipelineSettings()
+    }
 
-        FileLogger.shared.log("LATENCY", "Switching pipeline to \(use60Fps ? "60 FPS Ultra-Low-Latency (~35ms)" : "30 FPS Studio (~65ms)")")
+    private func applyVideoPipelineSettings() {
+        let num = is60FpsMode ? 60000240 : 30000030
+        let targetCanvasFps = is60FpsMode ? 60 : 30
+        let dims = captureDims
+        let resJson = "{\"width\":\(dims.w),\"height\":\(dims.h)}"
+
+        FileLogger.shared.log("VIDEO", "Switching pipeline to \(dims.w)x\(dims.h) @ \(targetCanvasFps) FPS (buffering=false)")
 
         sendOBSRequest(type: "SetInputSettings", data: [
             "inputName": "Pixel 10 Pro",
             "inputSettings": [
                 "buffering": false,
+                "resolution": resJson,
                 "frame_rate": [
                     "denominator": 1000000,
                     "numerator": num
@@ -750,19 +773,21 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         ])
 
         sendOBSRequest(type: "StopVirtualCam", data: [:], id: "vc_stop_fps")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
             guard let self = self else { return }
             self.sendOBSRequest(type: "SetVideoSettings", data: [
                 "fpsNumerator": targetCanvasFps,
                 "fpsDenominator": 1,
                 "baseWidth": 1920,
                 "baseHeight": 1080,
-                "outputWidth": 1920,
-                "outputHeight": 1080
+                "outputWidth": dims.w,
+                "outputHeight": dims.h
             ], id: "set_canvas_fps")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) { [weak self] in
-                self?.sendOBSRequest(type: "StartVirtualCam", data: [:], id: "vc_start_fps")
-                self?.applyRodeLipSyncImmediate()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) { [weak self] in
+                guard let self = self else { return }
+                self.applyFramingImmediate()
+                self.sendOBSRequest(type: "StartVirtualCam", data: [:], id: "vc_start_fps")
+                self.applyRodeLipSyncImmediate()
             }
         }
         onStatusChangeForMenuBar?()
@@ -865,17 +890,25 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     }
 
     func applyFramingImmediate() {
-        let baseW = 1920.0
-        let baseH = 1080.0
-        let scaledW = baseW * zoomLevel
-        let scaledH = baseH * zoomLevel
-        let maxOffsetX = (scaledW - baseW) / 2.0
-        let maxOffsetY = (scaledH - baseH) / 2.0
+        let canvasW = 1920.0
+        let canvasH = 1080.0
+        let dims = captureDims
+        let srcW = Double(dims.w)
+        let srcH = Double(dims.h)
 
-        let finalScaleX = isMirrored ? -zoomLevel : zoomLevel
+        // Base cover scale so any UVC resolution (1080p, 720p, 480p, 360p) cleanly fills the 1920x1080 canvas
+        let coverScale = max(canvasW / srcW, canvasH / srcH)
+        let effectiveScale = coverScale * zoomLevel
+
+        let scaledW = srcW * effectiveScale
+        let scaledH = srcH * effectiveScale
+        let maxOffsetX = (scaledW - canvasW) / 2.0
+        let maxOffsetY = (scaledH - canvasH) / 2.0
+
+        let finalScaleX = isMirrored ? -effectiveScale : effectiveScale
         let posX: Double
         if isMirrored {
-            posX = baseW + maxOffsetX + (panX * maxOffsetX)
+            posX = canvasW + maxOffsetX + (panX * maxOffsetX)
         } else {
             posX = -(maxOffsetX) + (panX * maxOffsetX)
         }
@@ -883,7 +916,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
 
         let transform: [String: Any] = [
             "scaleX": finalScaleX,
-            "scaleY": zoomLevel,
+            "scaleY": effectiveScale,
             "positionX": posX,
             "positionY": posY,
             "boundsType": "OBS_BOUNDS_NONE"
@@ -2083,12 +2116,27 @@ struct StudioPanelView: View {
 
                         Spacer()
 
-                        Button(ctrl.is60FpsMode ? "30 FPS" : "✅ 30") {
+                        // Resolution Selector Menu (1080p / 720p / 480p / 360p)
+                        Menu {
+                            Button("1080p Full HD (1920×1080)") { ctrl.setCameraResolution("1080p") }
+                            Button("720p HD Eco (1280×720)") { ctrl.setCameraResolution("720p") }
+                            Button("480p Classic (640×480)") { ctrl.setCameraResolution("480p") }
+                            Button("360p Lite (640×360)") { ctrl.setCameraResolution("360p") }
+                        } label: {
+                            Text(ctrl.selectedResolution)
+                                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                        }
+                        .menuStyle(.borderedButton)
+                        .controlSize(.mini)
+                        .frame(width: 58)
+                        .help(ctrl.tr("Выбор разрешения видеопотока Pixel 10 Pro", "Select Pixel 10 Pro UVC video resolution"))
+
+                        Button(ctrl.is60FpsMode ? "30" : "✅ 30") {
                             ctrl.setCameraFpsMode(use60Fps: false)
                         }
                         .buttonStyle(.bordered).controlSize(.mini)
 
-                        Button(ctrl.is60FpsMode ? "⚡ 60 FPS" : "60 FPS") {
+                        Button(ctrl.is60FpsMode ? "⚡ 60" : "60") {
                             ctrl.setCameraFpsMode(use60Fps: true)
                         }
                         .buttonStyle(.borderedProminent).tint(ctrl.is60FpsMode ? .green : .gray).controlSize(.mini)
@@ -2491,6 +2539,24 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         lutParent.submenu = lutMenu
         menu.addItem(lutParent)
 
+        let resMenu = NSMenu()
+        let resolutions: [(String, String)] = [
+            ("1080p Full HD (1920×1080)", "1080p"),
+            ("720p HD Eco (1280×720)", "720p"),
+            ("480p Classic (640×480)", "480p"),
+            ("360p Lite (640×360)", "360p")
+        ]
+        for (title, id) in resolutions {
+            let item = NSMenuItem(title: title, action: #selector(menuSelectResolution(_:)), keyEquivalent: "")
+            item.target = self
+            item.representedObject = id
+            item.state = (ctrl.selectedResolution == id) ? .on : .off
+            resMenu.addItem(item)
+        }
+        let resParent = NSMenuItem(title: ctrl.tr("📐 Разрешение (\(ctrl.selectedResolution))", "📐 Resolution (\(ctrl.selectedResolution))"), action: nil, keyEquivalent: "")
+        resParent.submenu = resMenu
+        menu.addItem(resParent)
+
         menu.addItem(NSMenuItem.separator())
 
         let fps60Item = NSMenuItem(title: ctrl.tr("⚡ 60 FPS Ультранизкая задержка (~35 мс)", "⚡ 60 FPS Ultra-Low-Latency (~35 ms)"), action: #selector(menuSet60Fps), keyEquivalent: "")
@@ -2540,6 +2606,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
     @objc func menuSelectLut(_ sender: NSMenuItem) {
         if let id = sender.representedObject as? String { ctrl.selectLUT(id) }
+    }
+    @objc func menuSelectResolution(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? String { ctrl.setCameraResolution(id) }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
