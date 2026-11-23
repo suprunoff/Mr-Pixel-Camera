@@ -1,0 +1,10 @@
+.DS_Store
+pixelprocam_debug.log
+PixelProCamStudio
+PixelProCam Studio.app/
+bin/
+Captures/
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
