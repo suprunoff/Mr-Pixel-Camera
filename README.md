@@ -62,8 +62,8 @@ Third-party webcam apps (`Camo`, `Iriun`, `DroidCam`) force you to install a hea
 
 ### Installation
 ```bash
-git clone https://github.com/suprunoff/PixelProCam-Studio.git
-cd PixelProCam-Studio
+git clone https://github.com/suprunoff/Mr-Pixel-Camera.git
+cd Mr-Pixel-Camera
 chmod +x install.sh
 ./install.sh
 ```
@@ -75,7 +75,7 @@ chmod +x install.sh
 ## 📁 Repository Structure
 
 ```text
-PixelProCam-Studio/
+Mr-Pixel-Camera/
 ├── macos/
 │   └── PixelProCamStudio.swift      # Native macOS SwiftUI + AppKit + Vision AI Studio Deck (EN/RU)
 ├── assets/

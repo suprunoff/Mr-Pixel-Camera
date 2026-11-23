@@ -3,7 +3,7 @@ set -e
 
 cd "$(dirname "$0")"
 
-REPO_NAME="${1:-PixelProCam-Studio}"
+REPO_NAME="${1:-Mr-Pixel-Camera}"
 VISIBILITY="${2:---public}"
 
 echo "🚀 Publishing $REPO_NAME to GitHub account $(gh api user -q .login 2>/dev/null || echo 'suprunoff')..."
