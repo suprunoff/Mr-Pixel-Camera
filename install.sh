@@ -1,11 +1,11 @@
 #!/bin/bash
 set -e
 
-echo "🎬 Installing PixelProCam Studio v2.0 for macOS..."
+echo "🎬 Installing Mr. Pixel Camera v2.1 for macOS (by mrmo.es)..."
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS_LUT_DIR="$HOME/Library/Application Support/obs-studio/LUTs"
-APP_BUNDLE="$REPO_DIR/PixelProCam Studio.app"
+APP_BUNDLE="$REPO_DIR/Mr. Pixel Camera.app"
 
 # 1. Install 3D LUTs (.cube) & Optical Overlays (.png) into OBS Studio
 mkdir -p "$OBS_LUT_DIR"
@@ -16,6 +16,7 @@ echo "✅ Installed 33x33x33 3D LUTs & Cinema Overlays into: $OBS_LUT_DIR"
 # 2. Build Native macOS App Bundle (Apple Silicon / Intel)
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
 cp -f "$REPO_DIR/assets/icons/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
+cp -f "$REPO_DIR/assets/icons/mo_logo.png" "$APP_BUNDLE/Contents/Resources/mo_logo.png"
 
 cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -27,17 +28,17 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <key>CFBundleIconFile</key>
     <string>AppIcon</string>
     <key>CFBundleIdentifier</key>
-    <string>com.suprunoff.PixelProCamStudio</string>
+    <string>es.mrmo.MrPixelCamera</string>
     <key>CFBundleName</key>
-    <string>PixelProCam Studio</string>
+    <string>Mr. Pixel Camera</string>
     <key>CFBundleDisplayName</key>
-    <string>PixelProCam Studio</string>
+    <string>Mr. Pixel Camera</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.0</string>
+    <string>2.1</string>
     <key>CFBundleVersion</key>
-    <string>20</string>
+    <string>21</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>

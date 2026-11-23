@@ -22,7 +22,7 @@ final class FileLogger {
     var onNewLogLine: ((String) -> Void)?
 
     private init() {
-        let header = "=== PixelProCam Studio v2.0 Diagnostic Log Started at \(Date()) ===\n"
+        let header = "=== PixelProCam Studio v2.1 Diagnostic Log Started at \(Date()) ===\n"
         try? header.write(toFile: logFilePath, atomically: true, encoding: .utf8)
     }
 
@@ -46,25 +46,71 @@ final class FileLogger {
     }
 }
 
-// MARK: - Isolated VU Meter State
+// MARK: - Isolated Sub-States (Prevents Main Window Redraw Storms)
 final class VuMeterState: ObservableObject {
     @Published var level: Double = 0.0
 }
 
-// MARK: - Studio Controller v2.0
+final class LivePreviewState: ObservableObject {
+    @Published var image: NSImage? = nil
+}
+
+// MARK: - Custom User Memory Slot Model (M1 / M2 / M3)
+struct StudioMemorySlot: Codable {
+    var selectedLUT: String
+    var lutIntensity: Double
+    var vignetteEnabled: Bool
+    var letterboxEnabled: Bool
+    var zoomLevel: Double
+    var panX: Double
+    var panY: Double
+    var isMirrored: Bool
+    var brightness: Double
+    var contrast: Double
+    var saturation: Double
+    var vargamma: Double
+    var hueShift: Double
+    var sharpness: Double
+}
+
+// MARK: - Studio Controller v2.1
 final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDelegate {
+    // Localization (EN / RU) & UI Modes
+    @Published var lang: String = {
+        if let saved = UserDefaults.standard.string(forKey: "pixelprocam_lang") {
+            return saved
+        }
+        let pref = Locale.preferredLanguages.first ?? "en"
+        return pref.lowercased().hasPrefix("ru") ? "ru" : "en"
+    }()
+    @Published var miniMode: Bool = false
+    @Published var showPreview: Bool = false
+    @Published var showGridOverlay: Bool = true
+    @Published var activeMemorySlot: Int = 0 // 0 = none, 1..3 = M1..M3
+    @Published var savedSlotsMask: Set<Int> = []
+
+    func tr(_ ru: String, _ en: String) -> String {
+        return lang == "ru" ? ru : en
+    }
+
+    func toggleLanguage() {
+        lang = (lang == "ru") ? "en" : "ru"
+        UserDefaults.standard.set(lang, forKey: "pixelprocam_lang")
+        FileLogger.shared.log("UI", "Switched language to \(lang.uppercased())")
+        onStatusChangeForMenuBar?()
+    }
+
     // Connection & Hardware status
     @Published var obsConnected: Bool = false
     @Published var pixelConnected: Bool = false
     @Published var pixelScreenUnlocked: Bool = true
-    @Published var currentFocusStatus: String = "Следящий ИИ-AF (CAF)"
-    @Published var currentCameraFacing: String = "1x Основной (50MP 24mm f/1.68)"
+    @Published var currentCameraFacing: String = "1x 24mm f/1.68"
     @Published var isHQMode: Bool = true
     @Published var is60FpsMode: Bool = true
 
     // Physical Lens & Prime Focal Length Selection
-    @Published var selectedPhysicalLens: String = "1x" // "0.5x", "1x", "2x", "5x", "front"
-    @Published var selectedPrimeFocal: String = "24mm" // "24mm", "35mm", "50mm", "85mm"
+    @Published var selectedPhysicalLens: String = "1x"
+    @Published var selectedPrimeFocal: String = "24mm"
 
     // Live OBS Telemetry & USB Cable Diagnostics
     @Published var obsFps: Double = 60.0
@@ -72,9 +118,8 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     @Published var obsCpuUsage: Double = 3.0
     @Published var obsSkippedFrames: Int = 0
     @Published var obsTotalFrames: Int = 0
-    @Published var usbCableSpeed: String = "USB 2.0 (480 Мбит/с)"
+    @Published var usbCableSpeed: String = "2.0 (480M)"
     @Published var usbIsSuperSpeed: Bool = false
-    @Published var usbPowerProfile: String = "15W PD (5V/3A)"
     @Published var pixelBatteryLevel: Int = 100
     @Published var pixelTempC: Double = 36.0
     @Published var logEntries: [String] = []
@@ -88,9 +133,11 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     @Published var isMirrored: Bool = false
     @Published var alwaysOnTop: Bool = false
     @Published var aiAutoFrameEnabled: Bool = false
-    @Published var aiFaceStatus: String = "Выкл"
+    @Published var aiFaceStatus: String = "OFF"
     private var dollyTimer: Timer?
     private var aiFrameTimer: Timer?
+    private var previewTimer: Timer?
+    private var previewInFlight: Bool = false
     private var forceImmediateAiFrame: Bool = false
     private var lastDetectedFaceX: Double = 0.5
     private var lastDetectedFaceY: Double = 0.45
@@ -119,7 +166,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
 
     // Studio Features & RØDE NT1 5th Gen (Pure DSP + Lip-Sync)
     @Published var activeLightingPreset: String = "day"
-    @Published var activeAudioPreset: String = "pure" // "pure", "radio", "voice"
+    @Published var activeAudioPreset: String = "pure"
     @Published var rodeLipSyncMs: Double = 35.0
     @Published var rodeSafetyLimiter: Bool = true
     @Published var isRodeMuted: Bool = false
@@ -128,7 +175,9 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     @Published var isBlackoutEnabled: Bool = false
 
     let vuState = VuMeterState()
+    let previewState = LivePreviewState()
     var onStatusChangeForMenuBar: (() -> Void)?
+    var onWindowSizeChangeRequested: (() -> Void)?
 
     private var webSocketTask: URLSessionWebSocketTask?
     private var urlSession: URLSession!
@@ -144,12 +193,13 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
 
     let adbPath: String = {
         let bundled = Bundle.main.bundlePath + "/Contents/MacOS/adb"
+        let mrPixelApp = "\(NSHomeDirectory())/Desktop/PixelProCam/Mr. Pixel Camera.app/Contents/MacOS/adb"
         let desktopApp = "\(NSHomeDirectory())/Desktop/PixelProCam/PixelProCam Studio.app/Contents/MacOS/adb"
         let localBin = "\(NSHomeDirectory())/Desktop/PixelProCam/bin/adb"
-        for p in [bundled, desktopApp, localBin, "/opt/homebrew/bin/adb", "/usr/local/bin/adb"] {
+        for p in [bundled, mrPixelApp, desktopApp, localBin, "/opt/homebrew/bin/adb", "/usr/local/bin/adb"] {
             if FileManager.default.isExecutableFile(atPath: p) { return p }
         }
-        return desktopApp
+        return mrPixelApp
     }()
 
     @Published var pixelSerial: String = "55141FDCH000EC"
@@ -171,6 +221,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     override init() {
         super.init()
         try? FileManager.default.createDirectory(atPath: capturesDir, withIntermediateDirectories: true)
+        refreshSavedMemorySlots()
 
         FileLogger.shared.onNewLogLine = { [weak self] line in
             guard let self = self else { return }
@@ -179,7 +230,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 self.logEntries.removeFirst(self.logEntries.count - 60)
             }
         }
-        FileLogger.shared.log("INIT", "Starting PixelProCam Studio v2.0 Pro Cinema Dark Edition")
+        FileLogger.shared.log("INIT", "Starting PixelProCam Studio v2.1 (EN/RU + Live Preview + 2D Pad + M1-M3 + Mini Mode)")
 
         let config = URLSessionConfiguration.default
         urlSession = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
@@ -198,6 +249,108 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             }
             self.checkPixelStatusLight()
         }
+    }
+
+    // MARK: - Live Preview Monitor Control
+    func togglePreviewMonitor(_ enabled: Bool) {
+        showPreview = enabled
+        previewTimer?.invalidate()
+        previewTimer = nil
+        previewInFlight = false
+        if enabled {
+            requestPreviewFrame()
+            // 6 FPS lightweight preview (zero GPU stall, only runs while preview is visible)
+            previewTimer = Timer.scheduledTimer(withTimeInterval: 0.16, repeats: true) { [weak self] _ in
+                self?.requestPreviewFrame()
+            }
+        } else {
+            previewState.image = nil
+        }
+        onWindowSizeChangeRequested?()
+    }
+
+    func toggleMiniMode(_ enabled: Bool) {
+        miniMode = enabled
+        if enabled && showPreview {
+            togglePreviewMonitor(false)
+        }
+        onWindowSizeChangeRequested?()
+    }
+
+    private func requestPreviewFrame() {
+        guard obsConnected, showPreview, !previewInFlight else { return }
+        previewInFlight = true
+        sendOBSRequest(type: "GetSourceScreenshot", data: [
+            "sourceName": "Сцена",
+            "imageFormat": "jpg",
+            "imageWidth": 512,
+            "imageHeight": 288,
+            "imageCompressionQuality": 68
+        ], id: "live_preview_frame")
+    }
+
+    // MARK: - User Memory Slots (M1 / M2 / M3)
+    private func refreshSavedMemorySlots() {
+        var mask: Set<Int> = []
+        for idx in 1...3 {
+            if UserDefaults.standard.data(forKey: "pixelprocam_mem_\(idx)") != nil {
+                mask.insert(idx)
+            }
+        }
+        savedSlotsMask = mask
+    }
+
+    func saveMemorySlot(_ slot: Int) {
+        let data = StudioMemorySlot(
+            selectedLUT: selectedLUT,
+            lutIntensity: lutIntensity,
+            vignetteEnabled: vignetteEnabled,
+            letterboxEnabled: letterboxEnabled,
+            zoomLevel: zoomLevel,
+            panX: panX,
+            panY: panY,
+            isMirrored: isMirrored,
+            brightness: brightness,
+            contrast: contrast,
+            saturation: saturation,
+            vargamma: vargamma,
+            hueShift: hueShift,
+            sharpness: sharpness
+        )
+        if let encoded = try? JSONEncoder().encode(data) {
+            UserDefaults.standard.set(encoded, forKey: "pixelprocam_mem_\(slot)")
+            savedSlotsMask.insert(slot)
+            activeMemorySlot = slot
+            lastCaptureMessage = tr("💾 Сохранено в слот M\(slot)", "💾 Saved look to slot M\(slot)")
+            FileLogger.shared.log("MEMORY", "Saved custom studio look into slot M\(slot)")
+        }
+    }
+
+    func loadMemorySlot(_ slot: Int) {
+        guard let raw = UserDefaults.standard.data(forKey: "pixelprocam_mem_\(slot)"),
+              let mem = try? JSONDecoder().decode(StudioMemorySlot.self, from: raw) else {
+            // If slot is empty, save current settings into it!
+            saveMemorySlot(slot)
+            return
+        }
+        activeMemorySlot = slot
+        selectedLUT = mem.selectedLUT
+        lutIntensity = mem.lutIntensity
+        isMirrored = mem.isMirrored
+        brightness = mem.brightness
+        contrast = mem.contrast
+        saturation = mem.saturation
+        vargamma = mem.vargamma
+        hueShift = mem.hueShift
+        sharpness = mem.sharpness
+
+        applyLUTDebounced()
+        setVignette(mem.vignetteEnabled)
+        setCinemaLetterbox(mem.letterboxEnabled)
+        applyColorCorrection()
+        smoothFrameTo(zoom: mem.zoomLevel, panX: mem.panX, panY: mem.panY)
+        lastCaptureMessage = tr("✨ Загружен слот M\(slot)", "✨ Loaded custom slot M\(slot)")
+        FileLogger.shared.log("MEMORY", "Loaded custom studio look from slot M\(slot)")
     }
 
     private func discoverAdbDeviceSerial() {
@@ -309,6 +462,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                     FileLogger.shared.log("WS-ERR", "OBS WebSocket disconnected: \(err.localizedDescription)")
                 }
                 self.obsConnected = false
+                self.previewInFlight = false
                 self.onStatusChangeForMenuBar?()
             }
         }
@@ -320,7 +474,20 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     }
 
     private func handleObsResponse(reqId: String, data: [String: Any]) {
-        if reqId == "get_items", let items = data["sceneItems"] as? [[String: Any]] {
+        if reqId == "live_preview_frame" {
+            self.previewInFlight = false
+            if let imgStr = data["imageData"] as? String,
+               let commaIdx = imgStr.firstIndex(of: ",") {
+                let b64 = String(imgStr[imgStr.index(after: commaIdx)...])
+                DispatchQueue.global(qos: .userInteractive).async {
+                    if let imgData = Data(base64Encoded: b64), let nsImg = NSImage(data: imgData) {
+                        DispatchQueue.main.async {
+                            self.previewState.image = nsImg
+                        }
+                    }
+                }
+            }
+        } else if reqId == "get_items", let items = data["sceneItems"] as? [[String: Any]] {
             var foundLetterbox = false
             for item in items {
                 let name = item["sourceName"] as? String ?? ""
@@ -414,7 +581,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     func takeStudioPhoto() {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd_HH-mm-ss"
-        let filename = "PixelProCam_Photo_\(df.string(from: Date())).png"
+        let filename = "MrPixelCamera_Photo_\(df.string(from: Date())).png"
         let fullPath = "\(capturesDir)/\(filename)"
 
         sendOBSRequest(type: "SaveSourceScreenshot", data: [
@@ -426,7 +593,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         ], id: "save_photo")
 
         NSSound(named: NSSound.Name("Tink"))?.play()
-        lastCaptureMessage = "📸 Сохранено: \(filename)"
+        lastCaptureMessage = tr("📸 Сохранено: \(filename)", "📸 Saved: \(filename)")
         FileLogger.shared.log("PHOTO", "Saved 1920x1080 studio snapshot to \(fullPath)")
     }
 
@@ -436,7 +603,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             recordSeconds = 0
             sendOBSRequest(type: "SetRecordDirectory", data: ["recordDirectory": capturesDir])
             sendOBSRequest(type: "StartRecord", data: [:], id: "start_rec")
-            lastCaptureMessage = "🔴 Запись видео в /Captures..."
+            lastCaptureMessage = tr("🔴 Запись в /Captures...", "🔴 Recording to /Captures...")
             FileLogger.shared.log("RECORD", "Started studio video recording to \(capturesDir)")
             recordTimer?.invalidate()
             recordTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
@@ -448,7 +615,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             recordTimer?.invalidate()
             recordTimer = nil
             sendOBSRequest(type: "StopRecord", data: [:], id: "stop_rec")
-            lastCaptureMessage = "🎬 Видео сохранено в Captures"
+            lastCaptureMessage = tr("🎬 Видео сохранено в Captures", "🎬 Video saved to Captures")
             FileLogger.shared.log("RECORD", "Stopped studio video recording (duration: \(recordSeconds)s)")
         }
         onStatusChangeForMenuBar?()
@@ -458,27 +625,33 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         NSWorkspace.shared.open(URL(fileURLWithPath: capturesDir))
     }
 
+    func openAuthorWebsite() {
+        if let url = URL(string: "https://mrmo.es") {
+            NSWorkspace.shared.open(url)
+        }
+    }
+
     // MARK: - Apple Vision Neural Engine AI Auto-Framing
     func toggleAiAutoFraming(_ enabled: Bool) {
         aiAutoFrameEnabled = enabled
         aiFrameTimer?.invalidate()
         aiFrameTimer = nil
         if enabled {
-            aiFaceStatus = "Активен (Vision AI)"
+            aiFaceStatus = "Vision AI"
             FileLogger.shared.log("VISION-AI", "Enabled Apple Vision Neural Engine Auto-Framing")
             requestVisionFrameOnce(immediate: true)
             aiFrameTimer = Timer.scheduledTimer(withTimeInterval: 2.5, repeats: true) { [weak self] _ in
                 self?.requestVisionFrameOnce(immediate: false)
             }
         } else {
-            aiFaceStatus = "Выкл"
+            aiFaceStatus = "OFF"
             FileLogger.shared.log("VISION-AI", "Disabled Apple Vision Auto-Framing")
         }
         onStatusChangeForMenuBar?()
     }
 
     func triggerSingleAiFaceFrame() {
-        aiFaceStatus = "Поиск лица..."
+        aiFaceStatus = "..."
         requestVisionFrameOnce(immediate: true)
     }
 
@@ -510,7 +683,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 guard let results = req.results as? [VNFaceObservation],
                       let mainFace = results.max(by: { ($0.boundingBox.width * $0.boundingBox.height) < ($1.boundingBox.width * $1.boundingBox.height) }) else {
                     DispatchQueue.main.async {
-                        self.aiFaceStatus = "Лицо не найдено"
+                        self.aiFaceStatus = self.tr("Нет лица", "No face")
                     }
                     return
                 }
@@ -546,7 +719,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                     let targetPanX = min(0.85, max(-0.85, rawPanX))
                     let targetPanY = min(0.85, max(-0.85, rawPanY))
 
-                    self.aiFaceStatus = String(format: "Захват (%.2fx)", desiredZoom)
+                    self.aiFaceStatus = String(format: "%.2fx", desiredZoom)
                     FileLogger.shared.log("VISION-AI", String(format: "Auto-Framing face (x=%.2f, y=%.2f) -> Zoom=%.2fx Pan=(%.2f, %.2f)", faceCenterX, faceCenterY, desiredZoom, targetPanX, targetPanY))
                     self.smoothFrameTo(zoom: desiredZoom, panX: targetPanX, panY: targetPanY)
                 }
@@ -555,7 +728,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         }
     }
 
-    // MARK: - Switch UVC Capture & OBS Canvas FPS Mode (60 FPS ~35ms vs 30 FPS ~65ms)
+    // MARK: - Switch UVC Capture & OBS Canvas FPS Mode
     func setCameraFpsMode(use60Fps: Bool) {
         is60FpsMode = use60Fps
         let num = use60Fps ? 60000240 : 30000030
@@ -598,51 +771,51 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     // MARK: - 1. Physical Lens & Prime Focal Length Selection
     func selectPhysicalLens(_ lens: String) {
         if !pixelScreenUnlocked {
-            FileLogger.shared.log("LENS-WARN", "Экран Pixel 10 Pro заблокирован! Разблокируйте телефон отпечатком 1 раз.")
+            FileLogger.shared.log("LENS-WARN", tr("Экран Pixel заблокирован! Разблокируйте отпечатком 1 раз.", "Pixel screen locked! Unlock once with fingerprint."))
         }
 
         switch lens {
         case "0.5x":
             selectedPhysicalLens = "0.5x"
             selectedPrimeFocal = "12mm"
-            currentCameraFacing = "0.5x Ультраширик (12mm f/2.2)"
-            FileLogger.shared.log("LENS", "Switched Pixel 10 Pro physical lens to 0.5x Ultra-Wide (12mm f/2.2)")
+            currentCameraFacing = "0.5x 12mm f/2.2"
+            FileLogger.shared.log("LENS", "Switched Pixel physical lens to 0.5x Ultra-Wide")
             runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 414 2149")
             smoothFrameTo(zoom: 1.0, panX: 0.0, panY: 0.0)
 
         case "1x":
             selectedPhysicalLens = "1x"
             selectedPrimeFocal = "24mm"
-            currentCameraFacing = "1x Основной (50MP 24mm f/1.68)"
-            FileLogger.shared.log("LENS", "Switched Pixel 10 Pro physical lens to 1x Main Wide (24mm f/1.68)")
+            currentCameraFacing = "1x 24mm f/1.68"
+            FileLogger.shared.log("LENS", "Switched Pixel physical lens to 1x Main Wide")
             runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 540 2149")
             smoothFrameTo(zoom: 1.0, panX: 0.0, panY: 0.0)
 
         case "2x":
             selectedPhysicalLens = "2x"
             selectedPrimeFocal = "50mm"
-            currentCameraFacing = "2x Портретный (50mm Оптика)"
-            FileLogger.shared.log("LENS", "Switched Pixel 10 Pro physical lens to 2x Optical (50mm)")
+            currentCameraFacing = "2x 50mm Optical"
+            FileLogger.shared.log("LENS", "Switched Pixel physical lens to 2x Optical")
             runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 666 2149")
             smoothFrameTo(zoom: 1.0, panX: 0.0, panY: 0.0)
 
         case "5x":
             selectedPhysicalLens = "5x"
             selectedPrimeFocal = "113mm"
-            currentCameraFacing = "5x Телевик (113mm Крупный план)"
-            FileLogger.shared.log("LENS", "Switched to 5x Telephoto mode (2x Optical Sensor + 2.25x OBS GPU Scale = 113mm)")
+            currentCameraFacing = "5x 113mm Tele"
+            FileLogger.shared.log("LENS", "Switched to 5x Telephoto mode (113mm)")
             runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 666 2149")
             smoothFrameTo(zoom: 2.25, panX: 0.0, panY: 0.0)
 
         case "front":
             selectedPhysicalLens = (selectedPhysicalLens == "front") ? "1x" : "front"
-            currentCameraFacing = (selectedPhysicalLens == "front") ? "Фронтальная (42MP 17mm f/2.2)" : "1x Основной (50MP 24mm f/1.68)"
-            FileLogger.shared.log("LENS", "Toggled Front / Rear camera module (126, 2149)")
+            currentCameraFacing = (selectedPhysicalLens == "front") ? "Front 42MP 17mm" : "1x 24mm f/1.68"
+            FileLogger.shared.log("LENS", "Toggled Front / Rear camera module")
             runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 126 2149")
             smoothFrameTo(zoom: 1.0, panX: 0.0, panY: 0.0)
 
         case "picker":
-            FileLogger.shared.log("LENS", "Opened native CameraPickerDialog on Pixel 10 Pro screen")
+            FileLogger.shared.log("LENS", "Opened native CameraPickerDialog on Pixel screen")
             runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input swipe 126 2149 126 2149 700")
 
         default:
@@ -655,16 +828,16 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         selectedPrimeFocal = focal
         switch focal {
         case "24mm":
-            FileLogger.shared.log("PRIME", "Prime Lens: 24mm f/1.68 (1.00x)")
+            FileLogger.shared.log("PRIME", "Prime Lens: 24mm (1.00x)")
             smoothFrameTo(zoom: 1.00, panX: 0.0, panY: 0.0)
         case "35mm":
-            FileLogger.shared.log("PRIME", "Prime Lens: 35mm f/1.4 Cinema (1.35x)")
+            FileLogger.shared.log("PRIME", "Prime Lens: 35mm (1.35x)")
             smoothFrameTo(zoom: 1.35, panX: 0.0, panY: 0.0)
         case "50mm":
-            FileLogger.shared.log("PRIME", "Prime Lens: 50mm f/1.2 Portrait (1.75x)")
+            FileLogger.shared.log("PRIME", "Prime Lens: 50mm (1.75x)")
             smoothFrameTo(zoom: 1.75, panX: 0.0, panY: 0.0)
         case "85mm":
-            FileLogger.shared.log("PRIME", "Prime Lens: 85mm f/1.4 Close-Up (2.35x)")
+            FileLogger.shared.log("PRIME", "Prime Lens: 85mm (2.35x)")
             smoothFrameTo(zoom: 2.35, panX: 0.0, panY: -0.05)
         default:
             break
@@ -677,7 +850,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         alwaysOnTop = enabled
         FileLogger.shared.log("WINDOW", "Always on Top = \(enabled)")
         DispatchQueue.main.async {
-            for win in NSApp.windows where win.title.contains("PixelProCam") {
+            for win in NSApp.windows where win.title.contains("Mr. Pixel") || win.title.contains("PixelProCam") {
                 win.level = enabled ? .floating : .normal
             }
         }
@@ -728,7 +901,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         let startX = self.panX
         let startY = self.panY
         if abs(targetZoom - startZoom) > 0.01 {
-            FileLogger.shared.log("DOLLY", String(format: "Smooth Dolly Zoom %.2fx -> %.2fx", startZoom, targetZoom))
+            FileLogger.shared.log("DOLLY", String(format: "Smooth Dolly %.2fx -> %.2fx", startZoom, targetZoom))
         }
 
         let steps = 18
@@ -1009,13 +1182,13 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 let ioOut = String(data: ioData, encoding: .utf8) ?? ""
                 if let range = ioOut.range(of: "Pixel") {
                     let sub = String(ioOut[range.lowerBound...].prefix(1800))
-                    var speedText = "USB 2.0 (480 Мбит/с)"
+                    var speedText = "2.0 (480M)"
                     var superSpeed = false
                     if sub.contains("\"UsbLinkSpeed\" = 10000000000") {
-                        speedText = "USB 3.2 (10 Гбит/с)"
+                        speedText = "3.2 (10G)"
                         superSpeed = true
                     } else if sub.contains("\"UsbLinkSpeed\" = 5000000000") {
-                        speedText = "USB 3.1 (5 Гбит/с)"
+                        speedText = "3.1 (5G)"
                         superSpeed = true
                     }
                     DispatchQueue.main.async {
@@ -1077,17 +1250,15 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     func triggerFaceAutofocus() {
         FileLogger.shared.log("ADB", "Triggering Face/Eye Center Lock AF (540, 1100)")
         runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 540 1100")
-        currentFocusStatus = "Точечный фокус (Лицо)"
     }
 
     func triggerContinuousAutofocus() {
         FileLogger.shared.log("ADB", "Resetting to Continuous Video AF (CAF)")
         runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 540 320")
-        currentFocusStatus = "Следящий ИИ-AF (CAF)"
     }
 
     func toggleHQMode() {
-        FileLogger.shared.log("ADB", "Toggling Pixel 10 Pro HQ Mode (954, 2149)")
+        FileLogger.shared.log("ADB", "Toggling Pixel HQ Mode (954, 2149)")
         runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 954 2149")
         isHQMode.toggle()
     }
@@ -1112,11 +1283,12 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     }
 }
 
-// MARK: - Isolated VU Meter Subview
+// MARK: - Isolated Subviews (VU Meter, Live Preview Monitor, 2D Framing Trackpad)
 struct IsolatedVuMeterBar: View {
     @ObservedObject var vuState: VuMeterState
     let isMuted: Bool
     let isEnabled: Bool
+    let placeholderText: String
 
     var body: some View {
         GeometryReader { geo in
@@ -1132,7 +1304,7 @@ struct IsolatedVuMeterBar: View {
                         ))
                         .frame(width: max(4, geo.size.width * (isMuted ? 0.0 : vuState.level)))
                 } else {
-                    Text("VU-метр выкл (0% CPU) • Включите справа для теста уровня")
+                    Text(placeholderText)
                         .font(.system(size: 9.5, weight: .medium))
                         .foregroundColor(.secondary)
                         .padding(.leading, 8)
@@ -1140,6 +1312,139 @@ struct IsolatedVuMeterBar: View {
             }
         }
         .frame(height: 16)
+    }
+}
+
+struct LiveCinemaPreviewView: View {
+    @ObservedObject var previewState: LivePreviewState
+    @ObservedObject var ctrl: StudioController
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.black)
+
+            if let img = previewState.image {
+                Image(nsImage: img)
+                    .resizable()
+                    .aspectRatio(16.0 / 9.0, contentMode: .fit)
+                    .cornerRadius(8)
+            } else {
+                HStack(spacing: 6) {
+                    ProgressView().scaleEffect(0.6)
+                    Text(ctrl.tr("Подключение видеопотока OBS...", "Connecting OBS live feed..."))
+                        .font(.system(size: 11))
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            // Optional Rule-of-Thirds 3x3 Cinema Grid
+            if ctrl.showGridOverlay {
+                GeometryReader { geo in
+                    Path { p in
+                        let w = geo.size.width
+                        let h = geo.size.height
+                        p.move(to: CGPoint(x: w / 3, y: 0)); p.addLine(to: CGPoint(x: w / 3, y: h))
+                        p.move(to: CGPoint(x: 2 * w / 3, y: 0)); p.addLine(to: CGPoint(x: 2 * w / 3, y: h))
+                        p.move(to: CGPoint(x: 0, y: h / 3)); p.addLine(to: CGPoint(x: w, y: h / 3))
+                        p.move(to: CGPoint(x: 0, y: 2 * h / 3)); p.addLine(to: CGPoint(x: w, y: 2 * h / 3))
+                    }
+                    .stroke(Color.white.opacity(0.28), lineWidth: 0.7)
+                }
+                .allowsHitTesting(false)
+            }
+
+            // Top-left live HUD overlay badges
+            VStack {
+                HStack {
+                    if ctrl.isRecording {
+                        HStack(spacing: 4) {
+                            Circle().fill(Color.red).frame(width: 7, height: 7)
+                            Text("REC").font(.system(size: 9, weight: .black, design: .monospaced))
+                        }
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.black.opacity(0.65)).foregroundColor(.white).cornerRadius(4)
+                    }
+                    Text("\(ctrl.selectedLUT.uppercased()) • \(Int(ctrl.obsFps)) FPS")
+                        .font(.system(size: 9, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(Color.black.opacity(0.6)).foregroundColor(.cyan).cornerRadius(4)
+
+                    Spacer()
+
+                    Button(action: { ctrl.showGridOverlay.toggle() }) {
+                        Text(ctrl.showGridOverlay ? "# 3×3: ON" : "# 3×3: OFF")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .padding(.horizontal, 6).padding(.vertical, 2)
+                            .background(Color.black.opacity(0.65))
+                            .foregroundColor(ctrl.showGridOverlay ? .yellow : .secondary)
+                            .cornerRadius(4)
+                    }
+                    .buttonStyle(.plain)
+                }
+                .padding(6)
+                Spacer()
+            }
+        }
+        .frame(width: 320, height: 180)
+        .overlay(RoundedRectangle(cornerRadius: 8).stroke(Color.white.opacity(0.15), lineWidth: 1))
+    }
+}
+
+struct InteractiveFramingPad: View {
+    @ObservedObject var ctrl: StudioController
+
+    var body: some View {
+        GeometryReader { geo in
+            let w = geo.size.width
+            let h = geo.size.height
+            let z = max(1.0, ctrl.zoomLevel)
+            let boxW = w / z
+            let boxH = h / z
+            let maxMoveX = (w - boxW) / 2.0
+            let maxMoveY = (h - boxH) / 2.0
+            let offsetX = -ctrl.panX * maxMoveX
+            let offsetY = -ctrl.panY * maxMoveY
+
+            ZStack {
+                RoundedRectangle(cornerRadius: 5)
+                    .fill(Color.black.opacity(0.5))
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(Color.white.opacity(0.16), lineWidth: 1))
+
+                // Crosshair
+                Path { p in
+                    p.move(to: CGPoint(x: w / 2, y: 4)); p.addLine(to: CGPoint(x: w / 2, y: h - 4))
+                    p.move(to: CGPoint(x: 4, y: h / 2)); p.addLine(to: CGPoint(x: w - 4, y: h / 2))
+                }
+                .stroke(Color.white.opacity(0.12), lineWidth: 0.6)
+
+                // Active Crop Viewport Rectangle
+                RoundedRectangle(cornerRadius: 3)
+                    .fill(Color.purple.opacity(0.28))
+                    .overlay(RoundedRectangle(cornerRadius: 3).stroke(Color.purple, lineWidth: 1.3))
+                    .frame(width: max(12, boxW), height: max(8, boxH))
+                    .offset(x: offsetX, y: offsetY)
+            }
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 0)
+                    .onChanged { val in
+                        if ctrl.zoomLevel < 1.10 {
+                            ctrl.zoomLevel = 1.22
+                        }
+                        let normX = (val.location.x / w - 0.5) * -2.0
+                        let normY = (val.location.y / h - 0.5) * -2.0
+                        ctrl.panX = min(1.0, max(-1.0, normX))
+                        ctrl.panY = min(1.0, max(-1.0, normY))
+                        ctrl.applyFramingImmediate()
+                    }
+            )
+            .onTapGesture(count: 2) {
+                ctrl.smoothFrameTo(zoom: ctrl.zoomLevel, panX: 0.0, panY: 0.0)
+            }
+        }
+        .frame(width: 96, height: 54)
+        .help(ctrl.tr("Тяните рамку для сдвига кадра • Двойной клик — центр", "Drag crop box to pan • Double-click to center"))
     }
 }
 
@@ -1160,10 +1465,10 @@ struct StudioCard<Content: View>: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 7) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
-                    .font(.system(size: 11, weight: .bold))
+                    .font(.system(size: 10.5, weight: .bold))
                     .foregroundColor(accent)
                     .frame(width: 18, height: 18)
                     .background(accent.opacity(0.16))
@@ -1184,54 +1489,66 @@ struct StudioCard<Content: View>: View {
             content
         }
         .padding(9)
-        .background(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .fill(Color.white.opacity(0.04))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 10, style: .continuous)
-                .stroke(Color.white.opacity(0.08), lineWidth: 1)
-        )
+        .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.04)))
+        .overlay(RoundedRectangle(cornerRadius: 10, style: .continuous).stroke(Color.white.opacity(0.08), lineWidth: 1))
     }
 }
 
-// MARK: - SwiftUI Pro Cinema Dark Deck (Zero-Scroll Ergonomic Layout)
+// MARK: - SwiftUI Pro Cinema Dark Deck v2.1
 struct StudioPanelView: View {
     @ObservedObject var ctrl: StudioController
 
     private func formatRecordTime(_ secs: Int) -> String {
-        let m = secs / 60
-        let s = secs % 60
-        return String(format: "%02d:%02d", m, s)
+        return String(format: "%02d:%02d", secs / 60, secs % 60)
+    }
+
+    var computedHeight: CGFloat {
+        if ctrl.miniMode { return 118 }
+        var h: CGFloat = 685
+        if ctrl.showPreview { h += 192 }
+        if ctrl.showLogs { h += 104 }
+        return h
     }
 
     var body: some View {
-        VStack(spacing: 8) {
-            // TOP TRANSPORT & STATUS HEADER BAR
-            HStack(spacing: 6) {
+        VStack(spacing: 7) {
+            // TOP TRANSPORT, LANGUAGE & MODE HEADER BAR
+            HStack(spacing: 5) {
                 HStack(spacing: 7) {
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(LinearGradient(colors: [.blue, .indigo], startPoint: .topLeading, endPoint: .bottomTrailing))
-                            .frame(width: 28, height: 28)
-                        Image(systemName: "camera.aperture")
-                            .font(.system(size: 14, weight: .bold))
-                            .foregroundColor(.white)
-                    }
-                    VStack(alignment: .leading, spacing: 1) {
-                        HStack(spacing: 5) {
-                            Text("PixelProCam Studio")
-                                .font(.system(size: 15, weight: .bold, design: .rounded))
-                            Text("v2.0")
-                                .font(.system(size: 9, weight: .bold, design: .monospaced))
-                                .padding(.horizontal, 5)
-                                .padding(.vertical, 1)
-                                .background(Color.blue.opacity(0.25))
-                                .foregroundColor(.cyan)
-                                .cornerRadius(4)
+                    Group {
+                        if let logoPath = Bundle.main.path(forResource: "mo_logo", ofType: "png") ?? (FileManager.default.fileExists(atPath: "\(NSHomeDirectory())/Desktop/PixelProCam/assets/icons/mo_logo.png") ? "\(NSHomeDirectory())/Desktop/PixelProCam/assets/icons/mo_logo.png" : nil),
+                           let nsLogo = NSImage(contentsOfFile: logoPath) {
+                            Image(nsImage: nsLogo)
+                                .resizable()
+                                .aspectRatio(contentMode: .fit)
+                                .frame(width: 30, height: 30)
+                                .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+                                .overlay(RoundedRectangle(cornerRadius: 7, style: .continuous).stroke(Color.white.opacity(0.18), lineWidth: 0.8))
+                        } else {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 7)
+                                    .fill(Color.black)
+                                    .frame(width: 30, height: 30)
+                                Text("Mo.")
+                                    .font(.system(size: 11, weight: .black, design: .serif))
+                                    .foregroundColor(.white)
+                            }
                         }
-                        Text(ctrl.lastCaptureMessage.isEmpty ? "Google Pixel 10 Pro • RØDE NT1 5th Gen • Apple Vision AI" : ctrl.lastCaptureMessage)
-                            .font(.system(size: 9.5, weight: .medium))
+                    }
+                    .onTapGesture { ctrl.openAuthorWebsite() }
+                    .help("mrmo.es")
+
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack(spacing: 4) {
+                            Text("Mr. Pixel Camera")
+                                .font(.system(size: 14, weight: .bold, design: .rounded))
+                            Text("v2.1")
+                                .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                                .padding(.horizontal, 4).padding(.vertical, 1)
+                                .background(Color.orange.opacity(0.22)).foregroundColor(.orange).cornerRadius(4)
+                        }
+                        Text(ctrl.lastCaptureMessage.isEmpty ? "Pixel 10 Pro • RØDE NT1 • Vision AI" : ctrl.lastCaptureMessage)
+                            .font(.system(size: 9, weight: .medium))
                             .foregroundColor(ctrl.lastCaptureMessage.isEmpty ? .secondary : .green)
                             .lineLimit(1)
                     }
@@ -1239,632 +1556,719 @@ struct StudioPanelView: View {
 
                 Spacer()
 
-                // Transport Controls
-                Button(action: { ctrl.setAlwaysOnTop(!ctrl.alwaysOnTop) }) {
+                // Preview Toggle
+                if !ctrl.miniMode {
+                    Button(action: { ctrl.togglePreviewMonitor(!ctrl.showPreview) }) {
+                        HStack(spacing: 3) {
+                            Image(systemName: ctrl.showPreview ? "eye.fill" : "eye")
+                            Text(ctrl.tr("Превью", "Preview"))
+                        }
+                        .font(.system(size: 9.5, weight: .bold))
+                        .padding(.horizontal, 7).padding(.vertical, 5)
+                        .background(ctrl.showPreview ? Color.purple : Color.white.opacity(0.08))
+                        .foregroundColor(.white).cornerRadius(6)
+                    }
+                    .buttonStyle(.plain)
+                }
+
+                // Mini Mode Toggle
+                Button(action: { ctrl.toggleMiniMode(!ctrl.miniMode) }) {
                     HStack(spacing: 3) {
-                        Image(systemName: ctrl.alwaysOnTop ? "pin.fill" : "pin")
-                        Text(ctrl.alwaysOnTop ? "ЗАКРЕП" : "ПОВЕРХ")
+                        Image(systemName: ctrl.miniMode ? "rectangle.expand.vertical" : "rectangle.compress.vertical")
+                        Text(ctrl.miniMode ? ctrl.tr("Полный", "Full") : ctrl.tr("Мини", "Mini"))
                     }
-                    .font(.system(size: 10, weight: .bold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(ctrl.alwaysOnTop ? Color.indigo : Color.white.opacity(0.08))
-                    .foregroundColor(.white)
-                    .cornerRadius(6)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 5)
+                    .background(ctrl.miniMode ? Color.teal : Color.white.opacity(0.08))
+                    .foregroundColor(.white).cornerRadius(6)
                 }
                 .buttonStyle(.plain)
 
+                // Pin Always on Top
+                Button(action: { ctrl.setAlwaysOnTop(!ctrl.alwaysOnTop) }) {
+                    Image(systemName: ctrl.alwaysOnTop ? "pin.fill" : "pin")
+                        .font(.system(size: 10.5))
+                        .padding(.horizontal, 6).padding(.vertical, 5)
+                        .background(ctrl.alwaysOnTop ? Color.indigo : Color.white.opacity(0.08))
+                        .foregroundColor(.white).cornerRadius(6)
+                }
+                .buttonStyle(.plain)
+                .help(ctrl.tr("Закрепить поверх всех окон", "Pin window always on top"))
+
+                // Studio Photo
                 Button(action: { ctrl.takeStudioPhoto() }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Image(systemName: "camera.fill")
-                        Text("ФОТО")
+                        Text(ctrl.tr("ФОТО", "PHOTO"))
                     }
-                    .font(.system(size: 10, weight: .bold))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
-                    .background(Color.cyan.opacity(0.22))
-                    .foregroundColor(.cyan)
-                    .cornerRadius(6)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 5)
+                    .background(Color.cyan.opacity(0.22)).foregroundColor(.cyan).cornerRadius(6)
                 }
                 .buttonStyle(.plain)
 
+                // Video Record
                 Button(action: { ctrl.toggleStudioRecording() }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Image(systemName: ctrl.isRecording ? "stop.circle.fill" : "record.circle")
-                        Text(ctrl.isRecording ? "СТОП \(formatRecordTime(ctrl.recordSeconds))" : "ЗАПИСЬ")
+                        Text(ctrl.isRecording ? formatRecordTime(ctrl.recordSeconds) : ctrl.tr("ЗАПИСЬ", "REC"))
                     }
-                    .font(.system(size: 10, weight: .bold, design: .monospaced))
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 5)
+                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                    .padding(.horizontal, 7).padding(.vertical, 5)
                     .background(ctrl.isRecording ? Color.red : Color.red.opacity(0.22))
-                    .foregroundColor(ctrl.isRecording ? .white : .red)
-                    .cornerRadius(6)
+                    .foregroundColor(ctrl.isRecording ? .white : .red).cornerRadius(6)
                 }
                 .buttonStyle(.plain)
 
                 Button(action: { ctrl.openCapturesFolder() }) {
                     Image(systemName: "folder.fill")
-                        .font(.system(size: 10.5))
-                        .padding(.horizontal, 7)
-                        .padding(.vertical, 5)
-                        .background(Color.white.opacity(0.08))
-                        .cornerRadius(6)
+                        .font(.system(size: 10))
+                        .padding(.horizontal, 6).padding(.vertical, 5)
+                        .background(Color.white.opacity(0.08)).cornerRadius(6)
                 }
                 .buttonStyle(.plain)
-                .help("Открыть папку Captures")
+                .help(ctrl.tr("Открыть папку Captures", "Open Captures folder"))
 
+                // Privacy Standby
                 Button(action: { ctrl.togglePrivacyStandby() }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Image(systemName: ctrl.isPrivacyStandby ? "play.fill" : "pause.fill")
-                        Text(ctrl.isPrivacyStandby ? "В ЭФИР" : "ПАУЗА")
+                        Text(ctrl.isPrivacyStandby ? ctrl.tr("ЭФИР", "LIVE") : ctrl.tr("ПАУЗА", "PAUSE"))
                     }
-                    .font(.system(size: 10, weight: .bold))
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
+                    .font(.system(size: 9.5, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 5)
                     .background(ctrl.isPrivacyStandby ? Color.red : Color.orange.opacity(0.22))
-                    .foregroundColor(ctrl.isPrivacyStandby ? .white : .orange)
-                    .cornerRadius(6)
+                    .foregroundColor(ctrl.isPrivacyStandby ? .white : .orange).cornerRadius(6)
                 }
                 .buttonStyle(.plain)
 
-                // Connection Pills
-                VStack(alignment: .trailing, spacing: 2) {
-                    HStack(spacing: 4) {
-                        Circle().fill(ctrl.obsConnected ? Color.green : Color.red).frame(width: 6, height: 6)
-                        Text("OBS \(Int(ctrl.obsFps))fps").font(.system(size: 9, weight: .bold, design: .monospaced))
-                    }
-                    HStack(spacing: 4) {
-                        Circle().fill(ctrl.pixelConnected ? (ctrl.pixelScreenUnlocked ? Color.green : Color.orange) : Color.orange).frame(width: 6, height: 6)
-                        Text(ctrl.pixelScreenUnlocked ? "Pixel USB" : "Блок экрана")
-                            .font(.system(size: 9, weight: .semibold))
-                    }
-                }
-                .padding(.leading, 2)
-            }
-            .padding(.horizontal, 10)
-            .padding(.vertical, 7)
-            .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.35)))
-
-            // QUICK LIGHTING SCENARIOS BAR
-            HStack(spacing: 6) {
-                Label("Свет:", systemImage: "sparkles")
-                    .font(.system(size: 10.5, weight: .bold))
-                    .foregroundColor(.yellow)
-                    .padding(.trailing, 2)
-                presetBtn(title: "☀️ Дневной офис", id: "day")
-                presetBtn(title: "🌆 Вечер / Тёплый", id: "evening")
-                presetBtn(title: "🖥 Свет от монитора", id: "monitor")
-                presetBtn(title: "🎙 Кино-Подкаст", id: "podcast")
-            }
-
-            // CARD 1: OPTICS, PHYSICAL LENSES & AUTOFOCUS
-            StudioCard(title: "1. Оптика Pixel 10 Pro, Кино-фиксы и Автофокус", icon: "camera.filters", accent: .blue, trailingText: ctrl.currentCameraFacing) {
-                VStack(spacing: 6) {
-                    if !ctrl.pixelScreenUnlocked {
-                        HStack(spacing: 6) {
-                            Image(systemName: "lock.iphone").foregroundColor(.orange)
-                            Text("Разблокируйте Pixel 10 Pro отпечатком 1 раз для переключения физических модулей камеры (Stay-On USB активен).")
-                                .font(.system(size: 9.5, weight: .medium)).foregroundColor(.orange)
-                            Spacer()
-                        }
-                        .padding(5)
-                        .background(Color.orange.opacity(0.14))
+                // Language Switcher EN / RU
+                Button(action: { ctrl.toggleLanguage() }) {
+                    Text(ctrl.lang == "ru" ? "RU" : "EN")
+                        .font(.system(size: 9.5, weight: .black, design: .monospaced))
+                        .padding(.horizontal, 6).padding(.vertical, 5)
+                        .background(Color.white.opacity(0.12))
+                        .foregroundColor(.yellow)
                         .cornerRadius(6)
-                    }
-
-                    // Physical Camera Modules
-                    HStack(spacing: 5) {
-                        Text("Сенсор:")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .frame(width: 52, alignment: .leading)
-
-                        lensBtn(title: "0.5x Ультраширик", subtitle: "12mm f/2.2", id: "0.5x")
-                        lensBtn(title: "1x Основной", subtitle: "24mm 50MP", id: "1x")
-                        lensBtn(title: "2x Портрет", subtitle: "50mm Оптика", id: "2x")
-                        lensBtn(title: "5x Телевик", subtitle: "113mm Крупный", id: "5x")
-                        lensBtn(title: "🤳 Селфи/Тыл", subtitle: "42MP 17mm", id: "front")
-
-                        Button(action: { ctrl.selectPhysicalLens("picker") }) {
-                            Image(systemName: "list.bullet.rectangle")
-                                .font(.system(size: 11))
-                                .padding(6)
-                                .background(Color.white.opacity(0.08))
-                                .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Открыть меню всех камер на экране Pixel 10 Pro")
-                    }
-
-                    // Zero-Latency Prime Focal Lengths + Autofocus Controls in one clean split row
-                    HStack(spacing: 5) {
-                        Text("Фиксы:")
-                            .font(.system(size: 10, weight: .semibold))
-                            .foregroundColor(.secondary)
-                            .frame(width: 52, alignment: .leading)
-
-                        primeBtn(title: "24mm f/1.68", id: "24mm")
-                        primeBtn(title: "35mm f/1.4", id: "35mm")
-                        primeBtn(title: "50mm f/1.2", id: "50mm")
-                        primeBtn(title: "85mm f/1.4", id: "85mm")
-
-                        Divider().frame(height: 18)
-
-                        Button(action: { ctrl.triggerFaceAutofocus() }) {
-                            HStack(spacing: 3) {
-                                Image(systemName: "face.smiling")
-                                Text("AF Лицо")
-                            }
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.blue)
-                            .foregroundColor(.white)
-                            .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: { ctrl.triggerContinuousAutofocus() }) {
-                            Text("Следящий AF")
-                                .font(.system(size: 10, weight: .medium))
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 4)
-                                .background(Color.white.opacity(0.08))
-                                .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: { ctrl.toggleHQMode() }) {
-                            Text(ctrl.isHQMode ? "HQ: ВКЛ" : "HQ: ВЫКЛ")
-                                .font(.system(size: 9.5, weight: .bold))
-                                .padding(.horizontal, 7)
-                                .padding(.vertical, 4)
-                                .background(ctrl.isHQMode ? Color.green.opacity(0.25) : Color.white.opacity(0.08))
-                                .foregroundColor(ctrl.isHQMode ? .green : .secondary)
-                                .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-
-                        Toggle("OLED Blackout", isOn: Binding(
-                            get: { ctrl.isBlackoutEnabled },
-                            set: { ctrl.togglePixelBlackout($0) }
-                        ))
-                        .toggleStyle(.checkbox)
-                        .font(.system(size: 10))
-                    }
                 }
+                .buttonStyle(.plain)
+                .help(ctrl.tr("Switch interface to English", "Переключить интерфейс на Русский"))
             }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 6)
+            .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.38)))
 
-            // CARD 2: FRAMING, SMOOTH DOLLY & APPLE VISION AI AUTO-FRAMING
-            StudioCard(title: "2. Кадрирование, Smooth Dolly & ИИ-Трекинг (Apple Vision)", icon: "viewfinder.circle.fill", accent: .purple, trailingText: String(format: "Зум %.2fx • ИИ: %@", ctrl.zoomLevel, ctrl.aiFaceStatus)) {
-                VStack(spacing: 6) {
-                    HStack(spacing: 6) {
-                        Toggle(isOn: Binding(
-                            get: { ctrl.aiAutoFrameEnabled },
-                            set: { ctrl.toggleAiAutoFraming($0) }
-                        )) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "brain.head.profile")
-                                    .foregroundColor(ctrl.aiAutoFrameEnabled ? .green : .purple)
-                                Text("ИИ-Слежение за лицом (Center Stage)")
-                                    .font(.system(size: 10.5, weight: .bold))
-                            }
-                        }
-                        .toggleStyle(.checkbox)
-
-                        Button(action: { ctrl.triggerSingleAiFaceFrame() }) {
-                            HStack(spacing: 3) {
-                                Image(systemName: "scope")
-                                Text("Навести по лицу")
-                            }
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(Color.purple.opacity(0.3))
-                            .foregroundColor(.white)
-                            .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-
-                        Spacer()
-
-                        dollyBtn("1.0x Общий", zoom: 1.0, py: 0.0)
-                        dollyBtn("1.22x По грудь", zoom: 1.22, py: -0.04)
-                        dollyBtn("1.5x Портрет", zoom: 1.5, py: -0.06)
-                        dollyBtn("2.0x Макро", zoom: 2.0, py: 0.0)
-                    }
-
-                    HStack(spacing: 8) {
-                        Text(String(format: "%.2fx", ctrl.zoomLevel))
-                            .font(.system(size: 10.5, weight: .bold, design: .monospaced))
-                            .frame(width: 40, alignment: .leading)
-
-                        Slider(value: Binding(
-                            get: { ctrl.zoomLevel },
-                            set: { ctrl.zoomLevel = $0; ctrl.applyFramingImmediate() }
-                        ), in: 1.0...2.5)
-
-                        // Compact Pan Joypad
-                        HStack(spacing: 3) {
-                            panBtn("⬅️") { ctrl.smoothFrameTo(zoom: max(1.15, ctrl.zoomLevel), panX: max(-1.0, ctrl.panX - 0.25), panY: ctrl.panY) }
-                            panBtn("⬆️") { ctrl.smoothFrameTo(zoom: max(1.15, ctrl.zoomLevel), panX: ctrl.panX, panY: max(-1.0, ctrl.panY - 0.25)) }
-                            panBtn("🎯") { ctrl.smoothFrameTo(zoom: ctrl.zoomLevel, panX: 0.0, panY: 0.0) }
-                            panBtn("⬇️") { ctrl.smoothFrameTo(zoom: max(1.15, ctrl.zoomLevel), panX: ctrl.panX, panY: min(1.0, ctrl.panY + 0.25)) }
-                            panBtn("➡️") { ctrl.smoothFrameTo(zoom: max(1.15, ctrl.zoomLevel), panX: min(1.0, ctrl.panX + 0.25), panY: ctrl.panY) }
-                        }
-
-                        Button(action: { ctrl.toggleMirror(!ctrl.isMirrored) }) {
-                            HStack(spacing: 4) {
-                                Image(systemName: "arrow.left.and.right.righttriangle.left.righttriangle.right.fill")
-                                Text(ctrl.isMirrored ? "Зеркало: ВКЛ" : "Зеркалить")
-                            }
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 4)
-                            .background(ctrl.isMirrored ? Color.blue : Color.white.opacity(0.08))
-                            .foregroundColor(.white)
-                            .cornerRadius(6)
-                        }
-                        .buttonStyle(.plain)
-                    }
-                }
-            }
-
-            // CARD 3: 3D CINEMA LUT CARDS, VIGNETTE & 2.35:1 ANAMORPHIC SCOPE
-            StudioCard(title: "3. Кинематографические 3D LUT и Анаморфотное Каше 2.35:1", icon: "film.stack", accent: .orange, trailingText: "Интенсивность: \(Int(ctrl.lutIntensity * 100))%") {
-                VStack(spacing: 6) {
-                    // 6 Visual 1-Click Cinema Look Cards
-                    HStack(spacing: 5) {
-                        lutCard(title: "🎬 S-Cinetone", sub: "Sony Alpha", id: "sony", color: .blue)
-                        lutCard(title: "✨ Pro-Mist", sub: "Тёплый/Мягкий", id: "promist", color: .orange)
-                        lutCard(title: "🎞 Kodak 2383", sub: "Киноплёнка", id: "kodak", color: .yellow)
-                        lutCard(title: "🔥 Teal & Orange", sub: "Голливуд", id: "teal", color: .teal)
-                        lutCard(title: "⚫️ Leica B&W", sub: "Монохром", id: "leica", color: .gray)
-                        lutCard(title: "🚫 Rec.709", sub: "Чистый", id: "none", color: .secondary)
-                    }
-
-                    HStack(spacing: 10) {
-                        Text("Сила LUT: \(Int(ctrl.lutIntensity * 100))%")
-                            .font(.system(size: 10.5, weight: .semibold))
-                            .frame(width: 85, alignment: .leading)
-
-                        Slider(value: Binding(
-                            get: { ctrl.lutIntensity },
-                            set: { ctrl.lutIntensity = $0; ctrl.applyLUTDebounced() }
-                        ), in: 0.0...1.0)
-
-                        Toggle("Виньетка 35mm f/1.4", isOn: Binding(
-                            get: { ctrl.vignetteEnabled },
-                            set: { ctrl.setVignette($0) }
-                        ))
-                        .toggleStyle(.checkbox)
-                        .font(.system(size: 10.5))
-
-                        Toggle("🎬 Кино-рамка 2.35:1", isOn: Binding(
-                            get: { ctrl.letterboxEnabled },
-                            set: { ctrl.setCinemaLetterbox($0) }
-                        ))
-                        .toggleStyle(.checkbox)
-                        .font(.system(size: 10.5, weight: .bold))
-                    }
-                }
-            }
-
-            // CARD 4: 2-COLUMN EXPOSURE, WHITE BALANCE & DETAIL MATRIX
-            StudioCard(title: "4. Экспозиция, Баланс Белого (ББ) и Детализация", icon: "slider.horizontal.3", accent: .cyan) {
-                VStack(spacing: 6) {
-                    HStack(spacing: 6) {
-                        Button(action: { ctrl.resetExposureAuto() }) {
-                            Label("АВТО Экспозиция", systemImage: "bolt.fill")
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 8).padding(.vertical, 4)
-                                .background(Color.indigo.opacity(0.35)).cornerRadius(5)
-                        }.buttonStyle(.plain)
-
-                        Button(action: { ctrl.resetWhiteBalanceAuto() }) {
-                            Label("АВТО Баланс Белого", systemImage: "thermometer.medium")
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 8).padding(.vertical, 4)
-                                .background(Color.teal.opacity(0.35)).cornerRadius(5)
-                        }.buttonStyle(.plain)
-
-                        Spacer()
-
-                        Button(action: { ctrl.resetAllImageAuto() }) {
-                            Label("Сброс всего в АВТО", systemImage: "arrow.counterclockwise")
-                                .font(.system(size: 10, weight: .medium))
-                                .padding(.horizontal, 8).padding(.vertical, 4)
-                                .background(Color.white.opacity(0.08)).cornerRadius(5)
-                        }.buttonStyle(.plain)
-                    }
-
-                    // 2x3 Compact Studio Slider Matrix
-                    HStack(spacing: 14) {
-                        VStack(spacing: 4) {
-                            compactSlider(label: "Экспозиция", value: $ctrl.brightness, range: -0.25...0.25, fmt: "%+.0f%%", mult: 100)
-                            compactSlider(label: "Контраст", value: $ctrl.contrast, range: -0.30...0.45, fmt: "%+.0f%%", mult: 100)
-                            compactSlider(label: "Гамма (Тени)", value: $ctrl.vargamma, range: -0.30...0.30, fmt: "%+.0f%%", mult: 100)
-                        }
-                        VStack(spacing: 4) {
-                            compactSlider(label: "ББ (Тёпл/Хол)", value: $ctrl.hueShift, range: -25.0...25.0, fmt: "%+.1f°", mult: 1)
-                            compactSlider(label: "Насыщенность", value: $ctrl.saturation, range: -0.40...0.50, fmt: "%+.0f%%", mult: 100)
-                            compactSlider(label: "Резкость", value: $ctrl.sharpness, range: 0.0...0.25, fmt: "%.0f%%", mult: 400)
-                        }
-                    }
-                }
-            }
-
-            // CARD 5: RØDE NT1 5th Gen STUDIO AUDIO & HARDWARE LIP-SYNC
-            StudioCard(title: "5. Аудио RØDE NT1 5th Gen (Родной APHEX DSP + Аппаратный Lip-Sync)", icon: "mic.fill", accent: .green, trailingText: "Задержка звука: +\(Int(ctrl.rodeLipSyncMs)) мс") {
-                VStack(spacing: 5) {
-                    HStack(spacing: 8) {
-                        IsolatedVuMeterBar(vuState: ctrl.vuState, isMuted: ctrl.isRodeMuted, isEnabled: ctrl.liveVuEnabled)
-
-                        Toggle("VU-Метр", isOn: Binding(
-                            get: { ctrl.liveVuEnabled },
-                            set: { ctrl.setLiveVuMeter(enabled: $0) }
-                        ))
-                        .toggleStyle(.checkbox)
-                        .font(.system(size: 10))
-
-                        Button(action: { ctrl.openRodeCentralApp() }) {
-                            HStack(spacing: 3) {
-                                Image(systemName: "slider.vertical.3")
-                                Text("RØDE Central")
-                            }
-                            .font(.system(size: 10, weight: .semibold))
-                            .padding(.horizontal, 8).padding(.vertical, 4)
-                            .background(Color.white.opacity(0.09)).cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-
-                        Button(action: { ctrl.toggleRodeMute() }) {
-                            Text(ctrl.isRodeMuted ? "🔇 МИКРОФОН ВЫКЛ" : "🎙 В ЭФИРЕ")
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 4)
-                                .background(ctrl.isRodeMuted ? Color.red : Color.green.opacity(0.25))
-                                .foregroundColor(ctrl.isRodeMuted ? .white : .green)
-                                .cornerRadius(5)
-                        }
-                        .buttonStyle(.plain)
-                    }
-
-                    HStack(spacing: 6) {
-                        audioPresetBtn(title: "🎯 Родной DSP RØDE Central (Без дублей)", id: "pure")
-                        audioPresetBtn(title: "📻 +OBS Радио-Бас", id: "radio")
-                        audioPresetBtn(title: "🎙 +OBS Чёткая речь", id: "voice")
-
-                        Divider().frame(height: 16)
-
-                        Text("⏱ Lip-Sync: +\(Int(ctrl.rodeLipSyncMs))мс")
-                            .font(.system(size: 10, weight: .bold, design: .monospaced))
-                            .frame(width: 105, alignment: .leading)
-
-                        Slider(value: Binding(
-                            get: { ctrl.rodeLipSyncMs },
-                            set: { ctrl.rodeLipSyncMs = $0; ctrl.applyRodeLipSyncDebounced() }
-                        ), in: 0.0...140.0)
-                        .frame(width: 90)
-
-                        Button(ctrl.is60FpsMode ? "35мс" : "65мс") {
-                            ctrl.rodeLipSyncMs = ctrl.is60FpsMode ? 35.0 : 65.0
-                            ctrl.applyRodeLipSyncImmediate()
-                        }
-                        .font(.system(size: 9.5, weight: .bold))
-                        .buttonStyle(.bordered)
-                        .controlSize(.mini)
-                    }
-                }
-            }
-
-            // FOOTER TELEMETRY & CABLE STRIP
-            VStack(spacing: 5) {
+            // MINI DECK MODE STRIP
+            if ctrl.miniMode {
                 HStack(spacing: 6) {
-                    statBadge(label: "FPS", value: String(format: "%.1f", ctrl.obsFps),
-                              ok: ctrl.obsFps >= (ctrl.is60FpsMode ? 55.0 : 28.5))
-                    statBadge(label: "Render", value: String(format: "%.1fms", ctrl.obsRenderTimeMs),
-                              ok: ctrl.obsRenderTimeMs < 13.5)
-                    statBadge(label: "CPU", value: String(format: "%.1f%%", ctrl.obsCpuUsage),
-                              ok: ctrl.obsCpuUsage < 25.0)
-                    statBadge(label: "Кабель", value: ctrl.usbCableSpeed, ok: true)
-                    statBadge(label: "PD", value: "15W", ok: true)
-                    statBadge(label: "Pixel", value: String(format: "%d%% • %.1f°C", ctrl.pixelBatteryLevel, ctrl.pixelTempC),
-                              ok: ctrl.pixelTempC < 41.0)
+                    lensMiniBtn("0.5x", id: "0.5x")
+                    lensMiniBtn("1x", id: "1x")
+                    lensMiniBtn("2x", id: "2x")
+                    lensMiniBtn("5x", id: "5x")
+                    lensMiniBtn("🤳", id: "front")
+
+                    Divider().frame(height: 18)
+
+                    lutMiniBtn("S-Cine", id: "sony", color: .blue)
+                    lutMiniBtn("ProMist", id: "promist", color: .orange)
+                    lutMiniBtn("Kodak", id: "kodak", color: .yellow)
+                    lutMiniBtn("Teal", id: "teal", color: .teal)
+                    lutMiniBtn("B&W", id: "leica", color: .gray)
+
+                    Divider().frame(height: 18)
+
+                    Button(action: { ctrl.triggerSingleAiFaceFrame() }) {
+                        Text("🎯 AI").font(.system(size: 9.5, weight: .bold))
+                            .padding(.horizontal, 7).padding(.vertical, 5)
+                            .background(Color.purple.opacity(0.35)).cornerRadius(5)
+                    }.buttonStyle(.plain)
+
+                    Button(action: { ctrl.toggleRodeMute() }) {
+                        Text(ctrl.isRodeMuted ? "🔇" : "🎙")
+                            .padding(.horizontal, 7).padding(.vertical, 4)
+                            .background(ctrl.isRodeMuted ? Color.red : Color.green.opacity(0.25)).cornerRadius(5)
+                    }.buttonStyle(.plain)
 
                     Spacer()
 
-                    Button(ctrl.is60FpsMode ? "30 FPS" : "✅ 30 FPS") {
-                        ctrl.setCameraFpsMode(use60Fps: false)
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
+                    Button(action: { ctrl.openAuthorWebsite() }) {
+                        Text("mrmo.es ↗")
+                            .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
+                            .foregroundColor(.cyan.opacity(0.85))
+                    }.buttonStyle(.plain)
+                }
+                .padding(.horizontal, 8).padding(.vertical, 6)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.white.opacity(0.04)))
+            } else {
+                // COLLAPSIBLE LIVE PREVIEW MONITOR
+                if ctrl.showPreview {
+                    HStack(spacing: 12) {
+                        LiveCinemaPreviewView(previewState: ctrl.previewState, ctrl: ctrl)
 
-                    Button(ctrl.is60FpsMode ? "⚡ 60 FPS (~35мс)" : "60 FPS") {
-                        ctrl.setCameraFpsMode(use60Fps: true)
-                    }
-                    .buttonStyle(.borderedProminent)
-                    .tint(ctrl.is60FpsMode ? .green : .gray)
-                    .controlSize(.mini)
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(ctrl.tr("📺 Живой Монитор Студии", "📺 Live Studio Monitor"))
+                                .font(.system(size: 11.5, weight: .bold))
+                            Text(ctrl.tr("Показывает финальный кадр с 3D LUT, виньеткой и 2.35:1.\nОкно OBS можно полностью скрыть (⌘H).", "Shows final graded output with 3D LUT, vignette & 2.35:1.\nYou can safely hide OBS (⌘H)."))
+                                .font(.system(size: 9.5))
+                                .foregroundColor(.secondary)
 
-                    Button(action: { ctrl.showLogs.toggle() }) {
-                        HStack(spacing: 2) {
-                            Image(systemName: ctrl.showLogs ? "chevron.up" : "chevron.down")
-                            Text("Логи")
+                            HStack(spacing: 6) {
+                                Button(action: { ctrl.triggerFaceAutofocus() }) {
+                                    Label(ctrl.tr("Фокус на лицо", "Face AF"), systemImage: "face.smiling")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .padding(.horizontal, 8).padding(.vertical, 5)
+                                        .background(Color.blue).foregroundColor(.white).cornerRadius(6)
+                                }.buttonStyle(.plain)
+
+                                Button(action: { ctrl.triggerSingleAiFaceFrame() }) {
+                                    Label(ctrl.tr("ИИ-Кадр", "AI Frame"), systemImage: "scope")
+                                        .font(.system(size: 10, weight: .bold))
+                                        .padding(.horizontal, 8).padding(.vertical, 5)
+                                        .background(Color.purple.opacity(0.45)).foregroundColor(.white).cornerRadius(6)
+                                }.buttonStyle(.plain)
+                            }
+                            Spacer()
                         }
+                        Spacer()
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.mini)
+                    .padding(8)
+                    .background(RoundedRectangle(cornerRadius: 10).fill(Color.black.opacity(0.32)))
+                    .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.purple.opacity(0.35), lineWidth: 1))
                 }
 
-                if ctrl.showLogs {
-                    ScrollView {
-                        VStack(alignment: .leading, spacing: 2) {
-                            ForEach(ctrl.logEntries.suffix(8), id: \.self) { line in
-                                Text(line)
-                                    .font(.system(size: 9, design: .monospaced))
-                                    .foregroundColor(line.contains("WARN") || line.contains("ERR") ? .orange : .secondary)
-                                    .frame(maxWidth: .infinity, alignment: .leading)
+                // QUICK LIGHTING SCENARIOS + CUSTOM MEMORY SLOTS (M1 / M2 / M3)
+                HStack(spacing: 5) {
+                    presetBtn(title: ctrl.tr("☀️ Офис", "☀️ Daylight"), id: "day")
+                    presetBtn(title: ctrl.tr("🌆 Вечер", "🌆 Warm"), id: "evening")
+                    presetBtn(title: ctrl.tr("🖥 Монитор", "🖥 Monitor"), id: "monitor")
+                    presetBtn(title: ctrl.tr("🎙 Подкаст", "🎙 Podcast"), id: "podcast")
+
+                    Divider().frame(height: 18)
+
+                    Text(ctrl.tr("Слоты:", "Looks:"))
+                        .font(.system(size: 9.5, weight: .bold))
+                        .foregroundColor(.secondary)
+
+                    ForEach(1...3, id: \.self) { slot in
+                        HStack(spacing: 2) {
+                            Button(action: { ctrl.loadMemorySlot(slot) }) {
+                                Text("M\(slot)")
+                                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                    .padding(.horizontal, 6).padding(.vertical, 4)
+                                    .background(ctrl.activeMemorySlot == slot ? Color.indigo : (ctrl.savedSlotsMask.contains(slot) ? Color.white.opacity(0.14) : Color.white.opacity(0.05)))
+                                    .foregroundColor(ctrl.savedSlotsMask.contains(slot) ? .white : .secondary)
+                                    .cornerRadius(5)
+                            }
+                            .buttonStyle(.plain)
+                            .help(ctrl.tr("Загрузить слот M\(slot)", "Load memory slot M\(slot)"))
+
+                            Button(action: { ctrl.saveMemorySlot(slot) }) {
+                                Image(systemName: "square.and.arrow.down")
+                                    .font(.system(size: 8.5))
+                                    .foregroundColor(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                            .help(ctrl.tr("Сохранить текущие настройки в M\(slot)", "Save current look to M\(slot)"))
+                        }
+                    }
+                }
+
+                // CARD 1: OPTICS, PHYSICAL LENSES & AUTOFOCUS
+                StudioCard(title: ctrl.tr("1. Оптика Pixel 10 Pro, Кино-фиксы и Автофокус", "1. Pixel 10 Pro Optics, Cinema Primes & Autofocus"), icon: "camera.filters", accent: .blue, trailingText: ctrl.currentCameraFacing) {
+                    VStack(spacing: 6) {
+                        if !ctrl.pixelScreenUnlocked {
+                            HStack(spacing: 6) {
+                                Image(systemName: "lock.iphone").foregroundColor(.orange)
+                                Text(ctrl.tr("Разблокируйте Pixel отпечатком 1 раз для переключения физических объективов (Stay-On USB активен).", "Unlock Pixel once with fingerprint to switch hardware lenses (Stay-On USB enabled)."))
+                                    .font(.system(size: 9.5, weight: .medium)).foregroundColor(.orange)
+                                Spacer()
+                            }
+                            .padding(5).background(Color.orange.opacity(0.14)).cornerRadius(6)
+                        }
+
+                        HStack(spacing: 5) {
+                            Text(ctrl.tr("Сенсор:", "Sensor:"))
+                                .font(.system(size: 10, weight: .semibold)).foregroundColor(.secondary)
+                                .frame(width: 50, alignment: .leading)
+
+                            lensBtn(title: ctrl.tr("0.5x Ширик", "0.5x Ultra"), subtitle: "12mm f/2.2", id: "0.5x")
+                            lensBtn(title: ctrl.tr("1x Основной", "1x Main"), subtitle: "24mm 50MP", id: "1x")
+                            lensBtn(title: ctrl.tr("2x Портрет", "2x Optical"), subtitle: "50mm Crop", id: "2x")
+                            lensBtn(title: ctrl.tr("5x Телевик", "5x Tele"), subtitle: "113mm", id: "5x")
+                            lensBtn(title: ctrl.tr("🤳 Селфи", "🤳 Front"), subtitle: "42MP 17mm", id: "front")
+
+                            Button(action: { ctrl.selectPhysicalLens("picker") }) {
+                                Image(systemName: "list.bullet.rectangle")
+                                    .font(.system(size: 11)).padding(6)
+                                    .background(Color.white.opacity(0.08)).cornerRadius(6)
+                            }
+                            .buttonStyle(.plain)
+                            .help(ctrl.tr("Меню всех камер на экране Pixel", "Open native Camera Picker on Pixel"))
+                        }
+
+                        HStack(spacing: 5) {
+                            Text(ctrl.tr("Фиксы:", "Primes:"))
+                                .font(.system(size: 10, weight: .semibold)).foregroundColor(.secondary)
+                                .frame(width: 50, alignment: .leading)
+
+                            primeBtn(title: "24mm", id: "24mm")
+                            primeBtn(title: "35mm", id: "35mm")
+                            primeBtn(title: "50mm", id: "50mm")
+                            primeBtn(title: "85mm", id: "85mm")
+
+                            Divider().frame(height: 16)
+
+                            Button(action: { ctrl.triggerFaceAutofocus() }) {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "face.smiling")
+                                    Text(ctrl.tr("AF Лицо", "Face AF"))
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 8).padding(.vertical, 4)
+                                .background(Color.blue).foregroundColor(.white).cornerRadius(5)
+                            }.buttonStyle(.plain)
+
+                            Button(action: { ctrl.triggerContinuousAutofocus() }) {
+                                Text(ctrl.tr("Следящий AF", "Continuous AF"))
+                                    .font(.system(size: 10, weight: .medium))
+                                    .padding(.horizontal, 7).padding(.vertical, 4)
+                                    .background(Color.white.opacity(0.08)).cornerRadius(5)
+                            }.buttonStyle(.plain)
+
+                            Button(action: { ctrl.toggleHQMode() }) {
+                                Text(ctrl.isHQMode ? "HQ: ON" : "HQ: OFF")
+                                    .font(.system(size: 9.5, weight: .bold))
+                                    .padding(.horizontal, 7).padding(.vertical, 4)
+                                    .background(ctrl.isHQMode ? Color.green.opacity(0.25) : Color.white.opacity(0.08))
+                                    .foregroundColor(ctrl.isHQMode ? .green : .secondary).cornerRadius(5)
+                            }.buttonStyle(.plain)
+
+                            Toggle("OLED Blackout", isOn: Binding(
+                                get: { ctrl.isBlackoutEnabled },
+                                set: { ctrl.togglePixelBlackout($0) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 10))
+                        }
+                    }
+                }
+
+                // CARD 2: FRAMING, INTERACTIVE 2D PAD & APPLE VISION AI
+                StudioCard(title: ctrl.tr("2. Кадрирование, 2D-Трекпад & ИИ-Трекинг (Apple Vision)", "2. Framing, 2D Trackpad & AI Face Tracking (Apple Vision)"), icon: "viewfinder.circle.fill", accent: .purple, trailingText: String(format: "%.2fx • AI: %@", ctrl.zoomLevel, ctrl.aiFaceStatus)) {
+                    HStack(spacing: 10) {
+                        VStack(spacing: 6) {
+                            HStack(spacing: 6) {
+                                Toggle(isOn: Binding(
+                                    get: { ctrl.aiAutoFrameEnabled },
+                                    set: { ctrl.toggleAiAutoFraming($0) }
+                                )) {
+                                    HStack(spacing: 4) {
+                                        Image(systemName: "brain.head.profile")
+                                            .foregroundColor(ctrl.aiAutoFrameEnabled ? .green : .purple)
+                                        Text(ctrl.tr("ИИ-Слежение (Center Stage)", "AI Center Stage Tracking"))
+                                            .font(.system(size: 10.5, weight: .bold))
+                                    }
+                                }
+                                .toggleStyle(.checkbox)
+
+                                Button(action: { ctrl.triggerSingleAiFaceFrame() }) {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "scope")
+                                        Text(ctrl.tr("Навести по лицу", "Frame Face"))
+                                    }
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 8).padding(.vertical, 3.5)
+                                    .background(Color.purple.opacity(0.35)).foregroundColor(.white).cornerRadius(5)
+                                }.buttonStyle(.plain)
+
+                                Spacer()
+
+                                Button(action: { ctrl.toggleMirror(!ctrl.isMirrored) }) {
+                                    HStack(spacing: 3) {
+                                        Image(systemName: "arrow.left.and.right.righttriangle.left.righttriangle.right.fill")
+                                        Text(ctrl.isMirrored ? ctrl.tr("Зеркало: ВКЛ", "Mirror: ON") : ctrl.tr("Зеркалить", "Mirror"))
+                                    }
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 7).padding(.vertical, 3.5)
+                                    .background(ctrl.isMirrored ? Color.blue : Color.white.opacity(0.08))
+                                    .foregroundColor(.white).cornerRadius(5)
+                                }.buttonStyle(.plain)
+                            }
+
+                            HStack(spacing: 6) {
+                                dollyBtn(ctrl.tr("1.0x Общий", "1.0x Wide"), zoom: 1.0, py: 0.0)
+                                dollyBtn(ctrl.tr("1.22x Студия", "1.22x Chest"), zoom: 1.22, py: -0.04)
+                                dollyBtn(ctrl.tr("1.5x Портрет", "1.5x Portrait"), zoom: 1.5, py: -0.06)
+                                dollyBtn(ctrl.tr("2.0x Макро", "2.0x Close"), zoom: 2.0, py: 0.0)
+
+                                Slider(value: Binding(
+                                    get: { ctrl.zoomLevel },
+                                    set: { ctrl.zoomLevel = $0; ctrl.applyFramingImmediate() }
+                                ), in: 1.0...2.5)
+                                .controlSize(.small)
                             }
                         }
-                        .padding(4)
-                    }
-                    .frame(height: 74)
-                    .background(Color.black.opacity(0.35))
-                    .cornerRadius(6)
 
-                    HStack {
-                        Text(FileLogger.shared.logFilePath)
-                            .font(.system(size: 9, design: .monospaced))
-                            .foregroundColor(.secondary)
-                        Spacer()
-                        Button("Очистить") { ctrl.logEntries.removeAll() }
-                            .buttonStyle(.bordered).controlSize(.mini)
-                        Button("Открыть .log") {
-                            NSWorkspace.shared.open(URL(fileURLWithPath: FileLogger.shared.logFilePath))
-                        }
-                        .buttonStyle(.bordered).controlSize(.mini)
+                        // Interactive 2D Pan/Tilt Framing Trackpad
+                        InteractiveFramingPad(ctrl: ctrl)
                     }
                 }
+
+                // CARD 3: 3D CINEMA LUT CARDS WITH COLOR SWATCHES & 2.35:1 SCOPE
+                StudioCard(title: ctrl.tr("3. Кинематографические 3D LUT и Анаморфотное Каше 2.35:1", "3. 3D Cinema LUTs & 2.35:1 Anamorphic Scope"), icon: "film.stack", accent: .orange, trailingText: "\(Int(ctrl.lutIntensity * 100))%") {
+                    VStack(spacing: 6) {
+                        HStack(spacing: 5) {
+                            lutCard(title: "S-Cinetone", sub: "Sony Alpha", id: "sony",
+                                    swatch: [Color(red: 0.15, green: 0.28, blue: 0.45), Color(red: 0.85, green: 0.65, blue: 0.52)], accent: .blue)
+                            lutCard(title: "Pro-Mist", sub: ctrl.tr("Тёплый/Мягкий", "Warm/Soft"), id: "promist",
+                                    swatch: [Color(red: 0.42, green: 0.25, blue: 0.18), Color(red: 0.98, green: 0.78, blue: 0.50)], accent: .orange)
+                            lutCard(title: "Kodak 2383", sub: ctrl.tr("Киноплёнка", "Film Print"), id: "kodak",
+                                    swatch: [Color(red: 0.12, green: 0.25, blue: 0.28), Color(red: 0.92, green: 0.74, blue: 0.42)], accent: .yellow)
+                            lutCard(title: "Teal & Orange", sub: ctrl.tr("Голливуд", "Blockbuster"), id: "teal",
+                                    swatch: [Color(red: 0.02, green: 0.55, blue: 0.62), Color(red: 0.98, green: 0.52, blue: 0.18)], accent: .teal)
+                            lutCard(title: "Leica B&W", sub: ctrl.tr("Монохром", "Monochrome"), id: "leica",
+                                    swatch: [Color.black, Color.gray, Color.white], accent: .gray)
+                            lutCard(title: "Rec.709", sub: ctrl.tr("Чистый", "Neutral"), id: "none",
+                                    swatch: [Color.white.opacity(0.25), Color.white.opacity(0.45)], accent: .secondary)
+                        }
+
+                        HStack(spacing: 10) {
+                            Text(ctrl.tr("Сила LUT: \(Int(ctrl.lutIntensity * 100))%", "LUT Strength: \(Int(ctrl.lutIntensity * 100))%"))
+                                .font(.system(size: 10, weight: .semibold))
+                                .frame(width: 96, alignment: .leading)
+
+                            Slider(value: Binding(
+                                get: { ctrl.lutIntensity },
+                                set: { ctrl.lutIntensity = $0; ctrl.applyLUTDebounced() }
+                            ), in: 0.0...1.0)
+                            .controlSize(.small)
+
+                            Toggle(ctrl.tr("Виньетка 35mm", "35mm Vignette"), isOn: Binding(
+                                get: { ctrl.vignetteEnabled },
+                                set: { ctrl.setVignette($0) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 10.5))
+
+                            Toggle(ctrl.tr("🎬 Рамка 2.35:1", "🎬 2.35:1 Scope"), isOn: Binding(
+                                get: { ctrl.letterboxEnabled },
+                                set: { ctrl.setCinemaLetterbox($0) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 10.5, weight: .bold))
+                        }
+                    }
+                }
+
+                // CARD 4: 2-COLUMN EXPOSURE, WHITE BALANCE & DETAIL MATRIX
+                StudioCard(title: ctrl.tr("4. Экспозиция, Баланс Белого (ББ) и Детализация", "4. Exposure, White Balance & Sharpening"), icon: "slider.horizontal.3", accent: .cyan) {
+                    VStack(spacing: 5) {
+                        HStack(spacing: 6) {
+                            Button(action: { ctrl.resetExposureAuto() }) {
+                                Label(ctrl.tr("АВТО Экспозиция", "AUTO Exposure"), systemImage: "bolt.fill")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 8).padding(.vertical, 3.5)
+                                    .background(Color.indigo.opacity(0.35)).cornerRadius(5)
+                            }.buttonStyle(.plain)
+
+                            Button(action: { ctrl.resetWhiteBalanceAuto() }) {
+                                Label(ctrl.tr("АВТО Баланс Белого", "AUTO White Balance"), systemImage: "thermometer.medium")
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 8).padding(.vertical, 3.5)
+                                    .background(Color.teal.opacity(0.35)).cornerRadius(5)
+                            }.buttonStyle(.plain)
+
+                            Spacer()
+
+                            Button(action: { ctrl.resetAllImageAuto() }) {
+                                Label(ctrl.tr("Сброс в АВТО", "Reset All Auto"), systemImage: "arrow.counterclockwise")
+                                    .font(.system(size: 10, weight: .medium))
+                                    .padding(.horizontal, 8).padding(.vertical, 3.5)
+                                    .background(Color.white.opacity(0.08)).cornerRadius(5)
+                            }.buttonStyle(.plain)
+                        }
+
+                        HStack(spacing: 14) {
+                            VStack(spacing: 3.5) {
+                                compactSlider(label: ctrl.tr("Экспозиция", "Exposure"), value: $ctrl.brightness, range: -0.25...0.25, fmt: "%+.0f%%", mult: 100)
+                                compactSlider(label: ctrl.tr("Контраст", "Contrast"), value: $ctrl.contrast, range: -0.30...0.45, fmt: "%+.0f%%", mult: 100)
+                                compactSlider(label: ctrl.tr("Гамма (Тени)", "Gamma"), value: $ctrl.vargamma, range: -0.30...0.30, fmt: "%+.0f%%", mult: 100)
+                            }
+                            VStack(spacing: 3.5) {
+                                compactSlider(label: ctrl.tr("ББ (Тёпл/Хол)", "White Balance"), value: $ctrl.hueShift, range: -25.0...25.0, fmt: "%+.1f°", mult: 1)
+                                compactSlider(label: ctrl.tr("Насыщенность", "Saturation"), value: $ctrl.saturation, range: -0.40...0.50, fmt: "%+.0f%%", mult: 100)
+                                compactSlider(label: ctrl.tr("Резкость", "Sharpness"), value: $ctrl.sharpness, range: 0.0...0.25, fmt: "%.0f%%", mult: 400)
+                            }
+                        }
+                    }
+                }
+
+                // CARD 5: RØDE NT1 5th Gen STUDIO AUDIO & HARDWARE LIP-SYNC
+                StudioCard(title: ctrl.tr("5. Аудио RØDE NT1 5th Gen (Родной APHEX DSP + Аппаратный Lip-Sync)", "5. RØDE NT1 5th Gen Audio (Native APHEX DSP + Hardware Lip-Sync)"), icon: "mic.fill", accent: .green, trailingText: "Lip-Sync: +\(Int(ctrl.rodeLipSyncMs)) ms") {
+                    VStack(spacing: 5) {
+                        HStack(spacing: 8) {
+                            IsolatedVuMeterBar(
+                                vuState: ctrl.vuState,
+                                isMuted: ctrl.isRodeMuted,
+                                isEnabled: ctrl.liveVuEnabled,
+                                placeholderText: ctrl.tr("VU-метр выкл (0% CPU) • Включите справа для теста уровня", "VU Meter OFF (0% CPU) • Toggle right to monitor levels")
+                            )
+
+                            Toggle("VU", isOn: Binding(
+                                get: { ctrl.liveVuEnabled },
+                                set: { ctrl.setLiveVuMeter(enabled: $0) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 10))
+
+                            Button(action: { ctrl.openRodeCentralApp() }) {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "slider.vertical.3")
+                                    Text("RØDE Central")
+                                }
+                                .font(.system(size: 10, weight: .semibold))
+                                .padding(.horizontal, 7).padding(.vertical, 3.5)
+                                .background(Color.white.opacity(0.09)).cornerRadius(5)
+                            }.buttonStyle(.plain)
+
+                            Button(action: { ctrl.toggleRodeMute() }) {
+                                Text(ctrl.isRodeMuted ? ctrl.tr("🔇 ВЫКЛ", "🔇 MUTED") : ctrl.tr("🎙 В ЭФИРЕ", "🎙 LIVE"))
+                                    .font(.system(size: 10, weight: .bold))
+                                    .padding(.horizontal, 8).padding(.vertical, 3.5)
+                                    .background(ctrl.isRodeMuted ? Color.red : Color.green.opacity(0.25))
+                                    .foregroundColor(ctrl.isRodeMuted ? .white : .green).cornerRadius(5)
+                            }.buttonStyle(.plain)
+                        }
+
+                        HStack(spacing: 5) {
+                            audioPresetBtn(title: ctrl.tr("🎯 Родной RØDE Central (Pure)", "🎯 Native RØDE Central (Pure)"), id: "pure")
+                            audioPresetBtn(title: ctrl.tr("📻 +OBS Радио", "📻 +OBS Broadcast"), id: "radio")
+                            audioPresetBtn(title: ctrl.tr("🎙 +OBS Речь", "🎙 +OBS Voice"), id: "voice")
+
+                            Divider().frame(height: 16)
+
+                            Text("⏱ +\(Int(ctrl.rodeLipSyncMs))ms")
+                                .font(.system(size: 10, weight: .bold, design: .monospaced))
+                                .frame(width: 56, alignment: .leading)
+
+                            Slider(value: Binding(
+                                get: { ctrl.rodeLipSyncMs },
+                                set: { ctrl.rodeLipSyncMs = $0; ctrl.applyRodeLipSyncDebounced() }
+                            ), in: 0.0...140.0)
+                            .frame(width: 90)
+                            .controlSize(.small)
+
+                            Button(ctrl.is60FpsMode ? "35ms" : "65ms") {
+                                ctrl.rodeLipSyncMs = ctrl.is60FpsMode ? 35.0 : 65.0
+                                ctrl.applyRodeLipSyncImmediate()
+                            }
+                            .font(.system(size: 9.5, weight: .bold))
+                            .buttonStyle(.bordered).controlSize(.mini)
+                        }
+                    }
+                }
+
+                // FOOTER TELEMETRY, CABLE & MRMO.ES CREDIT STRIP
+                VStack(spacing: 4) {
+                    HStack(spacing: 5) {
+                        statBadge(label: "FPS", value: String(format: "%.0f", ctrl.obsFps),
+                                  ok: ctrl.obsFps >= (ctrl.is60FpsMode ? 55.0 : 28.5))
+                        statBadge(label: "GPU", value: String(format: "%.1fms", ctrl.obsRenderTimeMs),
+                                  ok: ctrl.obsRenderTimeMs < 13.5)
+                        statBadge(label: "CPU", value: String(format: "%.1f%%", ctrl.obsCpuUsage),
+                                  ok: ctrl.obsCpuUsage < 25.0)
+                        statBadge(label: "USB", value: ctrl.usbCableSpeed, ok: true)
+                        statBadge(label: "Pixel", value: String(format: "%d%% %.0f°C", ctrl.pixelBatteryLevel, ctrl.pixelTempC),
+                                  ok: ctrl.pixelTempC < 41.0)
+
+                        Spacer()
+
+                        Button(ctrl.is60FpsMode ? "30 FPS" : "✅ 30") {
+                            ctrl.setCameraFpsMode(use60Fps: false)
+                        }
+                        .buttonStyle(.bordered).controlSize(.mini)
+
+                        Button(ctrl.is60FpsMode ? "⚡ 60 FPS" : "60 FPS") {
+                            ctrl.setCameraFpsMode(use60Fps: true)
+                        }
+                        .buttonStyle(.borderedProminent).tint(ctrl.is60FpsMode ? .green : .gray).controlSize(.mini)
+
+                        Button(action: {
+                            ctrl.showLogs.toggle()
+                            ctrl.onWindowSizeChangeRequested?()
+                        }) {
+                            HStack(spacing: 2) {
+                                Image(systemName: ctrl.showLogs ? "chevron.up" : "chevron.down")
+                                Text(ctrl.tr("Логи", "Logs"))
+                            }
+                        }
+                        .buttonStyle(.bordered).controlSize(.mini)
+
+                        // Author Website Credit Badge (mrmo.es)
+                        Button(action: { ctrl.openAuthorWebsite() }) {
+                            Text("mrmo.es ↗")
+                                .font(.system(size: 9.5, weight: .bold, design: .monospaced))
+                                .fixedSize(horizontal: true, vertical: false)
+                                .padding(.horizontal, 6).padding(.vertical, 2.5)
+                                .background(Color.cyan.opacity(0.14))
+                                .foregroundColor(.cyan)
+                                .cornerRadius(4)
+                        }
+                        .buttonStyle(.plain)
+                        .help("https://mrmo.es")
+                    }
+
+                    if ctrl.showLogs {
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 2) {
+                                ForEach(ctrl.logEntries.suffix(8), id: \.self) { line in
+                                    Text(line)
+                                        .font(.system(size: 9, design: .monospaced))
+                                        .foregroundColor(line.contains("WARN") || line.contains("ERR") ? .orange : .secondary)
+                                        .frame(maxWidth: .infinity, alignment: .leading)
+                                }
+                            }
+                            .padding(4)
+                        }
+                        .frame(height: 74)
+                        .background(Color.black.opacity(0.35))
+                        .cornerRadius(6)
+
+                        HStack {
+                            Text(FileLogger.shared.logFilePath)
+                                .font(.system(size: 9, design: .monospaced)).foregroundColor(.secondary)
+                            Spacer()
+                            Button(ctrl.tr("Очистить", "Clear")) { ctrl.logEntries.removeAll() }
+                                .buttonStyle(.bordered).controlSize(.mini)
+                            Button(ctrl.tr("Открыть .log", "Open .log")) {
+                                NSWorkspace.shared.open(URL(fileURLWithPath: FileLogger.shared.logFilePath))
+                            }
+                            .buttonStyle(.bordered).controlSize(.mini)
+                        }
+                    }
+                }
+                .padding(.horizontal, 8).padding(.vertical, 5)
+                .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.28)))
             }
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
-            .background(RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.28)))
         }
         .padding(10)
-        .frame(width: 660, height: ctrl.showLogs ? 775 : 675)
+        .frame(width: 716, height: computedHeight)
+        .background(Color(red: 0.08, green: 0.09, blue: 0.12))
+        .preferredColorScheme(.dark)
     }
 
     // MARK: - Custom Studio UI Components
     private func statBadge(label: String, value: String, ok: Bool) -> some View {
         HStack(spacing: 3) {
             Circle().fill(ok ? Color.green : Color.red).frame(width: 5.5, height: 5.5)
-            Text("\(label):").font(.system(size: 9.5)).foregroundColor(.secondary)
-            Text(value).font(.system(size: 9.5, weight: .bold, design: .monospaced))
+            Text("\(label):").font(.system(size: 9)).foregroundColor(.secondary)
+            Text(value).font(.system(size: 9, weight: .bold, design: .monospaced))
         }
-        .padding(.horizontal, 5)
-        .padding(.vertical, 2.5)
-        .background(Color.white.opacity(0.06))
-        .cornerRadius(4)
+        .fixedSize(horizontal: true, vertical: false)
+        .padding(.horizontal, 5).padding(.vertical, 2.5)
+        .background(Color.white.opacity(0.06)).cornerRadius(4)
     }
 
     private func lensBtn(title: String, subtitle: String, id: String) -> some View {
         let active = ctrl.selectedPhysicalLens == id
         return Button(action: { ctrl.selectPhysicalLens(id) }) {
             VStack(spacing: 1) {
-                Text(title)
-                    .font(.system(size: 10, weight: active ? .bold : .medium))
-                Text(subtitle)
-                    .font(.system(size: 8))
-                    .foregroundColor(active ? .white.opacity(0.85) : .secondary)
+                Text(title).font(.system(size: 10, weight: active ? .bold : .medium))
+                Text(subtitle).font(.system(size: 8)).foregroundColor(active ? .white.opacity(0.85) : .secondary)
             }
-            .frame(maxWidth: .infinity)
-            .padding(.vertical, 4)
+            .frame(maxWidth: .infinity).padding(.vertical, 4)
             .background(active ? Color.blue : Color.white.opacity(0.07))
-            .foregroundColor(.white)
-            .cornerRadius(6)
-        }
-        .buttonStyle(.plain)
+            .foregroundColor(.white).cornerRadius(6)
+        }.buttonStyle(.plain)
+    }
+
+    private func lensMiniBtn(_ title: String, id: String) -> some View {
+        let active = ctrl.selectedPhysicalLens == id
+        return Button(action: { ctrl.selectPhysicalLens(id) }) {
+            Text(title).font(.system(size: 9.5, weight: .bold))
+                .padding(.horizontal, 7).padding(.vertical, 5)
+                .background(active ? Color.blue : Color.white.opacity(0.08))
+                .foregroundColor(.white).cornerRadius(5)
+        }.buttonStyle(.plain)
+    }
+
+    private func lutMiniBtn(_ title: String, id: String, color: Color) -> some View {
+        let active = ctrl.selectedLUT == id
+        return Button(action: { ctrl.selectLUT(id) }) {
+            Text(title).font(.system(size: 9.5, weight: .bold))
+                .padding(.horizontal, 7).padding(.vertical, 5)
+                .background(active ? color.opacity(0.55) : Color.white.opacity(0.08))
+                .foregroundColor(.white).cornerRadius(5)
+        }.buttonStyle(.plain)
     }
 
     private func primeBtn(title: String, id: String) -> some View {
         let active = ctrl.selectedPrimeFocal == id
         return Button(action: { ctrl.selectPrimeFocalLength(id) }) {
-            Text(title)
-                .font(.system(size: 9.5, weight: active ? .bold : .medium))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+            Text(title).font(.system(size: 9.5, weight: active ? .bold : .medium))
+                .padding(.horizontal, 8).padding(.vertical, 4)
                 .background(active ? Color.indigo : Color.white.opacity(0.07))
-                .foregroundColor(.white)
-                .cornerRadius(5)
-        }
-        .buttonStyle(.plain)
+                .foregroundColor(.white).cornerRadius(5)
+        }.buttonStyle(.plain)
     }
 
     private func dollyBtn(_ title: String, zoom: Double, py: Double) -> some View {
         let active = abs(ctrl.zoomLevel - zoom) < 0.04
         return Button(action: { ctrl.smoothFrameTo(zoom: zoom, panX: 0, panY: py) }) {
-            Text(title)
-                .font(.system(size: 9.5, weight: active ? .bold : .medium))
-                .padding(.horizontal, 7)
-                .padding(.vertical, 3.5)
+            Text(title).font(.system(size: 9.5, weight: active ? .bold : .medium))
+                .padding(.horizontal, 6.5).padding(.vertical, 3.5)
                 .background(active ? Color.purple.opacity(0.45) : Color.white.opacity(0.07))
                 .cornerRadius(5)
-        }
-        .buttonStyle(.plain)
+        }.buttonStyle(.plain)
     }
 
-    private func panBtn(_ title: String, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 10))
-                .frame(width: 23, height: 21)
-                .background(Color.white.opacity(0.08))
-                .cornerRadius(4)
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func lutCard(title: String, sub: String, id: String, color: Color) -> some View {
+    private func lutCard(title: String, sub: String, id: String, swatch: [Color], accent: Color) -> some View {
         let active = ctrl.selectedLUT == id
         return Button(action: { ctrl.selectLUT(id) }) {
-            VStack(spacing: 1) {
-                Text(title)
-                    .font(.system(size: 9.5, weight: active ? .bold : .semibold))
-                    .lineLimit(1)
-                Text(sub)
-                    .font(.system(size: 8))
-                    .foregroundColor(active ? .white.opacity(0.85) : .secondary)
-                    .lineLimit(1)
+            VStack(spacing: 0) {
+                // Cinema Color Swatch Gradient Strip
+                LinearGradient(colors: swatch, startPoint: .leading, endPoint: .trailing)
+                    .frame(height: 4)
+
+                VStack(spacing: 1) {
+                    Text(title).font(.system(size: 9.5, weight: active ? .bold : .semibold)).lineLimit(1)
+                    Text(sub).font(.system(size: 8)).foregroundColor(active ? .white.opacity(0.85) : .secondary).lineLimit(1)
+                }
+                .padding(.vertical, 4.5)
+                .padding(.horizontal, 3)
             }
             .frame(maxWidth: .infinity)
-            .padding(.vertical, 5)
-            .background(active ? color.opacity(0.45) : Color.white.opacity(0.06))
-            .overlay(
-                RoundedRectangle(cornerRadius: 6)
-                    .stroke(active ? color : Color.clear, lineWidth: 1.2)
-            )
-            .cornerRadius(6)
-        }
-        .buttonStyle(.plain)
+            .background(active ? accent.opacity(0.32) : Color.white.opacity(0.06))
+            .clipShape(RoundedRectangle(cornerRadius: 6))
+            .overlay(RoundedRectangle(cornerRadius: 6).stroke(active ? accent : Color.white.opacity(0.06), lineWidth: active ? 1.4 : 0.7))
+        }.buttonStyle(.plain)
     }
 
     private func presetBtn(title: String, id: String) -> some View {
         let active = ctrl.activeLightingPreset == id
         return Button(action: { ctrl.applyLightingPreset(id) }) {
-            Text(title)
-                .font(.system(size: 10, weight: active ? .bold : .medium))
-                .frame(maxWidth: .infinity)
-                .padding(.vertical, 4.5)
+            Text(title).font(.system(size: 10, weight: active ? .bold : .medium))
+                .frame(maxWidth: .infinity).padding(.vertical, 4)
                 .background(active ? Color.blue.opacity(0.35) : Color.white.opacity(0.07))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 6)
-                        .stroke(active ? Color.cyan.opacity(0.7) : Color.clear, lineWidth: 1)
-                )
+                .overlay(RoundedRectangle(cornerRadius: 6).stroke(active ? Color.cyan.opacity(0.7) : Color.clear, lineWidth: 1))
                 .cornerRadius(6)
-        }
-        .buttonStyle(.plain)
+        }.buttonStyle(.plain)
     }
 
     private func audioPresetBtn(title: String, id: String) -> some View {
         let active = ctrl.activeAudioPreset == id
         return Button(action: { ctrl.setRodeAudioMode(id) }) {
-            Text(title)
-                .font(.system(size: 9.5, weight: active ? .bold : .medium))
-                .padding(.horizontal, 8)
-                .padding(.vertical, 4)
+            Text(title).font(.system(size: 9.5, weight: active ? .bold : .medium))
+                .padding(.horizontal, 7).padding(.vertical, 4)
                 .background(active ? Color.green.opacity(0.32) : Color.white.opacity(0.07))
                 .cornerRadius(5)
-        }
-        .buttonStyle(.plain)
+        }.buttonStyle(.plain)
     }
 
     private func compactSlider(label: String, value: Binding<Double>, range: ClosedRange<Double>, fmt: String, mult: Double) -> some View {
         HStack(spacing: 5) {
-            Text(label)
-                .font(.system(size: 10))
-                .foregroundColor(.secondary)
-                .frame(width: 82, alignment: .leading)
+            Text(label).font(.system(size: 10)).foregroundColor(.secondary)
+                .frame(width: 84, alignment: .leading)
             Slider(value: Binding(
                 get: { value.wrappedValue },
                 set: { value.wrappedValue = $0; ctrl.applyColorCorrection() }
@@ -1872,13 +2276,13 @@ struct StudioPanelView: View {
             .controlSize(.small)
             Text(String(format: fmt, value.wrappedValue * mult))
                 .font(.system(size: 9.5, weight: .semibold, design: .monospaced))
-                .foregroundColor(.primary.opacity(0.8))
+                .foregroundColor(.primary.opacity(0.85))
                 .frame(width: 38, alignment: .trailing)
         }
     }
 }
 
-// MARK: - AppDelegate with Persistent Top macOS Menu Bar (NSStatusItem)
+// MARK: - AppDelegate with Persistent Top macOS Menu Bar (Bilingual EN/RU)
 class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     var window: NSWindow!
     var statusItem: NSStatusItem!
@@ -1889,23 +2293,74 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let contentView = StudioPanelView(ctrl: ctrl)
         window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 660, height: 675),
+            contentRect: NSRect(x: 0, y: 0, width: 716, height: 685),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
         window.center()
-        window.title = "PixelProCam Studio v2.0 — Google Pixel 10 Pro & RØDE NT1"
+        window.title = "Mr. Pixel Camera v2.1 — mrmo.es"
         window.backgroundColor = NSColor(calibratedRed: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: contentView)
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
 
+        if CommandLine.arguments.contains("--screenshot") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+                guard let self = self, let view = self.window.contentView else { NSApp.terminate(nil); return }
+                self.ctrl.lang = "en"
+                self.ctrl.obsConnected = true
+                self.ctrl.pixelConnected = true
+                self.ctrl.pixelScreenUnlocked = true
+                self.ctrl.obsFps = 60.0
+                self.ctrl.obsRenderTimeMs = 7.4
+                self.ctrl.obsCpuUsage = 6.2
+                self.ctrl.usbCableSpeed = "2.0 (480M)"
+                self.ctrl.pixelBatteryLevel = 100
+                self.ctrl.pixelTempC = 36.2
+                self.ctrl.zoomLevel = 1.22
+                self.ctrl.aiFaceStatus = "1.22x"
+                self.ctrl.savedSlotsMask = [1, 2]
+                self.ctrl.activeMemorySlot = 1
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                    view.layoutSubtreeIfNeeded()
+                    let bounds = view.bounds
+                    if let rep = view.bitmapImageRepForCachingDisplay(in: bounds) {
+                        view.cacheDisplay(in: bounds, to: rep)
+                        if let png = rep.representation(using: .png, properties: [:]) {
+                            let out = "\(NSHomeDirectory())/Desktop/PixelProCam/assets/screenshots/studio_ui_v2.1.png"
+                            try? png.write(to: URL(fileURLWithPath: out))
+                        }
+                    }
+                    NSApp.terminate(nil)
+                }
+            }
+            return
+        }
+
         setupMenuBarExtra()
         ctrl.onStatusChangeForMenuBar = { [weak self] in
             self?.updateStatusButtonTitle()
         }
+        ctrl.onWindowSizeChangeRequested = { [weak self] in
+            self?.resizeWindowSmoothly()
+        }
+    }
+
+    func resizeWindowSmoothly() {
+        guard let win = window else { return }
+        var targetH: CGFloat = ctrl.miniMode ? 118 : 685
+        if !ctrl.miniMode {
+            if ctrl.showPreview { targetH += 192 }
+            if ctrl.showLogs { targetH += 104 }
+        }
+        let currentFrame = win.frame
+        let newContentRect = NSRect(x: 0, y: 0, width: 716, height: targetH)
+        let newFrameSize = win.frameRect(forContentRect: newContentRect).size
+        let deltaY = newFrameSize.height - currentFrame.size.height
+        let newFrame = NSRect(x: currentFrame.origin.x, y: currentFrame.origin.y - deltaY, width: newFrameSize.width, height: newFrameSize.height)
+        win.setFrame(newFrame, display: true, animate: true)
     }
 
     func setupMenuBarExtra() {
@@ -1920,75 +2375,77 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let btn = statusItem?.button else { return }
         if ctrl.isRecording {
             btn.image = NSImage(systemSymbolName: "record.circle.fill", accessibilityDescription: "Recording")
-            let m = ctrl.recordSeconds / 60
-            let s = ctrl.recordSeconds % 60
-            btn.title = String(format: " %02d:%02d", m, s)
+            btn.title = String(format: " %02d:%02d", ctrl.recordSeconds / 60, ctrl.recordSeconds % 60)
         } else if ctrl.isPrivacyStandby {
             btn.image = NSImage(systemSymbolName: "pause.circle.fill", accessibilityDescription: "Paused")
-            btn.title = " ПАУЗА"
+            btn.title = ctrl.tr(" ПАУЗА", " PAUSED")
         } else {
-            btn.image = NSImage(systemSymbolName: "video.fill", accessibilityDescription: "PixelProCam Studio")
-            btn.title = " PixelProCam"
+            btn.image = NSImage(systemSymbolName: "video.fill", accessibilityDescription: "Mr. Pixel Camera")
+            btn.title = " Mr. Pixel"
         }
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
 
-        let showTitle = window.isVisible ? "🎛 Показать / На передний план пульт" : "🎛 Открыть окно пульта PixelProCam"
+        let showTitle = ctrl.tr("🎛 Показать окно Mr. Pixel Camera", "🎛 Show Mr. Pixel Camera Window")
         let showItem = NSMenuItem(title: showTitle, action: #selector(toggleMainWindow), keyEquivalent: "p")
         showItem.target = self
         menu.addItem(showItem)
 
-        let pinItem = NSMenuItem(title: "📌 Закрепить пульт поверх всех окон", action: #selector(menuTogglePin), keyEquivalent: "")
+        let pinItem = NSMenuItem(title: ctrl.tr("📌 Закрепить поверх всех окон", "📌 Pin Always on Top"), action: #selector(menuTogglePin), keyEquivalent: "")
         pinItem.target = self
         pinItem.state = ctrl.alwaysOnTop ? .on : .off
         menu.addItem(pinItem)
 
+        let langItem = NSMenuItem(title: ctrl.tr("🌐 Language: Русский (Switch to English)", "🌐 Language: English (Переключить на Русский)"), action: #selector(menuToggleLang), keyEquivalent: "")
+        langItem.target = self
+        menu.addItem(langItem)
+
         menu.addItem(NSMenuItem.separator())
 
-        let photoItem = NSMenuItem(title: "📸 Сделать студийное ФОТО (1920×1080 PNG)", action: #selector(menuTakePhoto), keyEquivalent: "s")
+        let photoItem = NSMenuItem(title: ctrl.tr("📸 Сделать студийное ФОТО (1920×1080 PNG)", "📸 Take Studio PHOTO (1920×1080 PNG)"), action: #selector(menuTakePhoto), keyEquivalent: "s")
         photoItem.target = self
         menu.addItem(photoItem)
 
-        let recTitle = ctrl.isRecording ? "⏹ Остановить ЗАПИСЬ видео" : "🔴 Начать ЗАПИСЬ студийного видео"
+        let recTitle = ctrl.isRecording ? ctrl.tr("⏹ Остановить ЗАПИСЬ видео", "⏹ Stop Video Recording") : ctrl.tr("🔴 Начать ЗАПИСЬ студийного видео", "🔴 Start Studio Video Recording")
         let recItem = NSMenuItem(title: recTitle, action: #selector(menuToggleRec), keyEquivalent: "r")
         recItem.target = self
         menu.addItem(recItem)
 
-        let folderItem = NSMenuItem(title: "📂 Открыть папку Captures (Фото и Видео)", action: #selector(menuOpenCaptures), keyEquivalent: "")
+        let folderItem = NSMenuItem(title: ctrl.tr("📂 Открыть папку Captures", "📂 Open Captures Folder"), action: #selector(menuOpenCaptures), keyEquivalent: "")
         folderItem.target = self
         menu.addItem(folderItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        let standbyTitle = ctrl.isPrivacyStandby ? "▶️ ВЕРНУТЬСЯ В ЭФИР (Снять паузу)" : "⏸ НА ПАУЗУ (Заставка + Mute RØDE)"
+        let standbyTitle = ctrl.isPrivacyStandby ? ctrl.tr("▶️ ВЕРНУТЬСЯ В ЭФИР", "▶️ RESUME LIVE FEED") : ctrl.tr("⏸ НА ПАУЗУ (Заставка + Mute)", "⏸ PRIVACY STANDBY (Slate + Mute)")
         let standbyItem = NSMenuItem(title: standbyTitle, action: #selector(menuToggleStandby), keyEquivalent: "")
         standbyItem.target = self
         menu.addItem(standbyItem)
 
-        let muteTitle = ctrl.isRodeMuted ? "🔇 Микрофон RØDE NT1: ВЫКЛ (Включить)" : "🎙 Микрофон RØDE NT1: В ЭФИРЕ (Заглушить)"
+        let muteTitle = ctrl.isRodeMuted ? ctrl.tr("🔇 Микрофон RØDE: ВЫКЛ (Включить)", "🔇 RØDE Mic: MUTED (Unmute)") : ctrl.tr("🎙 Микрофон RØDE: В ЭФИРЕ (Заглушить)", "🎙 RØDE Mic: LIVE (Mute)")
         let muteItem = NSMenuItem(title: muteTitle, action: #selector(menuToggleMute), keyEquivalent: "m")
         muteItem.target = self
         menu.addItem(muteItem)
 
         menu.addItem(NSMenuItem.separator())
 
-        let aiItem = NSMenuItem(title: "🧠 ИИ-Автокадрирование по лицу (Apple Vision)", action: #selector(menuToggleAi), keyEquivalent: "")
+        let aiItem = NSMenuItem(title: ctrl.tr("🧠 ИИ-Автокадрирование (Apple Vision)", "🧠 AI Face Auto-Framing (Apple Vision)"), action: #selector(menuToggleAi), keyEquivalent: "")
         aiItem.target = self
         aiItem.state = ctrl.aiAutoFrameEnabled ? .on : .off
         menu.addItem(aiItem)
 
-        let aiOnceItem = NSMenuItem(title: "🎯 Центрировать кадр по лицу (1 раз)", action: #selector(menuAiOnce), keyEquivalent: "")
+        let aiOnceItem = NSMenuItem(title: ctrl.tr("🎯 Навести по лицу (1 раз)", "🎯 Frame Face Once"), action: #selector(menuAiOnce), keyEquivalent: "")
         aiOnceItem.target = self
         menu.addItem(aiOnceItem)
 
-        let mirrorItem = NSMenuItem(title: "🪞 Зеркалить картинку", action: #selector(menuToggleMirror), keyEquivalent: "")
+        let mirrorItem = NSMenuItem(title: ctrl.tr("🪞 Зеркалить картинку", "🪞 Mirror Horizontal"), action: #selector(menuToggleMirror), keyEquivalent: "")
         mirrorItem.target = self
         mirrorItem.state = ctrl.isMirrored ? .on : .off
         menu.addItem(mirrorItem)
 
-        let letterboxItem = NSMenuItem(title: "🎬 Кино-рамка 2.35:1 Cinema Scope", action: #selector(menuToggleLetterbox), keyEquivalent: "")
+        let letterboxItem = NSMenuItem(title: ctrl.tr("🎬 Кино-рамка 2.35:1", "🎬 2.35:1 Cinema Scope"), action: #selector(menuToggleLetterbox), keyEquivalent: "")
         letterboxItem.target = self
         letterboxItem.state = ctrl.letterboxEnabled ? .on : .off
         menu.addItem(letterboxItem)
@@ -1997,11 +2454,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         let lensMenu = NSMenu()
         let lenses: [(String, String)] = [
-            ("0.5x Ультраширик (12mm f/2.2)", "0.5x"),
-            ("1x Основной (24mm 50MP)", "1x"),
-            ("2x Портрет (50mm Оптика)", "2x"),
-            ("5x Телевик (113mm Крупный)", "5x"),
-            ("🤳 Селфи / Тыл (42MP 17mm)", "front")
+            (ctrl.tr("0.5x Ультраширик (12mm)", "0.5x Ultra-Wide (12mm)"), "0.5x"),
+            (ctrl.tr("1x Основной (24mm 50MP)", "1x Main Wide (24mm 50MP)"), "1x"),
+            (ctrl.tr("2x Портрет (50mm Оптика)", "2x Optical Portrait (50mm)"), "2x"),
+            (ctrl.tr("5x Телевик (113mm)", "5x Telephoto (113mm)"), "5x"),
+            (ctrl.tr("🤳 Селфи / Тыл (42MP)", "🤳 Front / Rear (42MP)"), "front")
         ]
         for (title, id) in lenses {
             let item = NSMenuItem(title: title, action: #selector(menuSelectLens(_:)), keyEquivalent: "")
@@ -2010,21 +2467,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.state = (ctrl.selectedPhysicalLens == id) ? .on : .off
             lensMenu.addItem(item)
         }
-        lensMenu.addItem(NSMenuItem.separator())
-        let primes: [(String, String)] = [
-            ("Кино-фикс 24mm f/1.68 (1.0x)", "24mm"),
-            ("Кино-фикс 35mm f/1.4 (1.35x)", "35mm"),
-            ("Кино-фикс 50mm f/1.2 (1.75x)", "50mm"),
-            ("Кино-фикс 85mm f/1.4 (2.35x)", "85mm")
-        ]
-        for (title, id) in primes {
-            let item = NSMenuItem(title: title, action: #selector(menuSelectPrime(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = id
-            item.state = (ctrl.selectedPrimeFocal == id) ? .on : .off
-            lensMenu.addItem(item)
-        }
-        let lensParent = NSMenuItem(title: "📷 Объектив и Фокусное расстояние", action: nil, keyEquivalent: "")
+        let lensParent = NSMenuItem(title: ctrl.tr("📷 Объектив Pixel 10 Pro", "📷 Pixel 10 Pro Lens"), action: nil, keyEquivalent: "")
         lensParent.submenu = lensMenu
         menu.addItem(lensParent)
 
@@ -2035,7 +2478,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             ("🎞 Kodak 2383 Film Print", "kodak"),
             ("🔥 Teal & Orange", "teal"),
             ("⚫️⚪️ Leica Monochrome", "leica"),
-            ("🚫 Без LUT (Чистый Rec.709)", "none")
+            (ctrl.tr("🚫 Без LUT (Rec.709)", "🚫 Pure Rec.709 (Off)"), "none")
         ]
         for (title, id) in luts {
             let item = NSMenuItem(title: title, action: #selector(menuSelectLut(_:)), keyEquivalent: "")
@@ -2044,43 +2487,29 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             item.state = (ctrl.selectedLUT == id) ? .on : .off
             lutMenu.addItem(item)
         }
-        let lutParent = NSMenuItem(title: "🎨 Кино-стиль (3D LUT)", action: nil, keyEquivalent: "")
+        let lutParent = NSMenuItem(title: ctrl.tr("🎨 Кино-стиль (3D LUT)", "🎨 3D Cinema LUT"), action: nil, keyEquivalent: "")
         lutParent.submenu = lutMenu
         menu.addItem(lutParent)
 
-        let lightMenu = NSMenu()
-        let lights: [(String, String)] = [
-            ("☀️ Дневной офис", "day"),
-            ("🌆 Вечер / Тёплый", "evening"),
-            ("🖥 Свет от монитора", "monitor"),
-            ("🎙 Кино-Подкаст", "podcast")
-        ]
-        for (title, id) in lights {
-            let item = NSMenuItem(title: title, action: #selector(menuSelectLight(_:)), keyEquivalent: "")
-            item.target = self
-            item.representedObject = id
-            item.state = (ctrl.activeLightingPreset == id) ? .on : .off
-            lightMenu.addItem(item)
-        }
-        let lightParent = NSMenuItem(title: "☀️ Сценарий освещения", action: nil, keyEquivalent: "")
-        lightParent.submenu = lightMenu
-        menu.addItem(lightParent)
-
         menu.addItem(NSMenuItem.separator())
 
-        let fps60Item = NSMenuItem(title: "⚡ 60 FPS Ultra-Low-Latency (~35 мс задержка)", action: #selector(menuSet60Fps), keyEquivalent: "")
+        let fps60Item = NSMenuItem(title: ctrl.tr("⚡ 60 FPS Ультранизкая задержка (~35 мс)", "⚡ 60 FPS Ultra-Low-Latency (~35 ms)"), action: #selector(menuSet60Fps), keyEquivalent: "")
         fps60Item.target = self
         fps60Item.state = ctrl.is60FpsMode ? .on : .off
         menu.addItem(fps60Item)
 
-        let fps30Item = NSMenuItem(title: "🎥 30 FPS Studio (~65 мс задержка)", action: #selector(menuSet30Fps), keyEquivalent: "")
+        let fps30Item = NSMenuItem(title: ctrl.tr("🎥 30 FPS Студия (~65 мс)", "🎥 30 FPS Studio (~65 ms)"), action: #selector(menuSet30Fps), keyEquivalent: "")
         fps30Item.target = self
         fps30Item.state = !ctrl.is60FpsMode ? .on : .off
         menu.addItem(fps30Item)
 
         menu.addItem(NSMenuItem.separator())
 
-        let quitItem = NSMenuItem(title: "🚪 Выйти из PixelProCam Studio", action: #selector(menuQuit), keyEquivalent: "q")
+        let siteItem = NSMenuItem(title: "🌐 mrmo.es", action: #selector(menuOpenSite), keyEquivalent: "")
+        siteItem.target = self
+        menu.addItem(siteItem)
+
+        let quitItem = NSMenuItem(title: ctrl.tr("🚪 Выйти из Mr. Pixel Camera", "🚪 Quit Mr. Pixel Camera"), action: #selector(menuQuit), keyEquivalent: "q")
         quitItem.target = self
         menu.addItem(quitItem)
     }
@@ -2091,6 +2520,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func menuTogglePin() { ctrl.setAlwaysOnTop(!ctrl.alwaysOnTop) }
+    @objc func menuToggleLang() { ctrl.toggleLanguage() }
     @objc func menuTakePhoto() { ctrl.takeStudioPhoto() }
     @objc func menuToggleRec() { ctrl.toggleStudioRecording() }
     @objc func menuOpenCaptures() { ctrl.openCapturesFolder() }
@@ -2102,30 +2532,14 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func menuToggleLetterbox() { ctrl.setCinemaLetterbox(!ctrl.letterboxEnabled) }
     @objc func menuSet60Fps() { ctrl.setCameraFpsMode(use60Fps: true) }
     @objc func menuSet30Fps() { ctrl.setCameraFpsMode(use60Fps: false) }
+    @objc func menuOpenSite() { ctrl.openAuthorWebsite() }
     @objc func menuQuit() { NSApp.terminate(nil) }
 
     @objc func menuSelectLens(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String {
-            ctrl.selectPhysicalLens(id)
-        }
+        if let id = sender.representedObject as? String { ctrl.selectPhysicalLens(id) }
     }
-
-    @objc func menuSelectPrime(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String {
-            ctrl.selectPrimeFocalLength(id)
-        }
-    }
-
     @objc func menuSelectLut(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String {
-            ctrl.selectLUT(id)
-        }
-    }
-
-    @objc func menuSelectLight(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String {
-            ctrl.applyLightingPreset(id)
-        }
+        if let id = sender.representedObject as? String { ctrl.selectLUT(id) }
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
