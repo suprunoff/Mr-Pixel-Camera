@@ -40,6 +40,8 @@ Third-party webcam apps (`Camo`, `Iriun`, `DroidCam`) force you to install a hea
 
 ## ✨ What's New in v2.1 Pro Cinema Dark Edition
 
+- **🚀 Smart Auto-Start & Launch at Login:** Automatically starts `OBS Studio` quietly in the background (`--startvirtualcam --minimize-to-tray`) and supports native macOS `LaunchAgent` startup directly into the Menu Bar.
+- **📐 Hardware UVC Resolution Switcher (`1080p` / `720p` / `480p` / `360p`):** Instant resolution & `30/60 FPS` switching with automatic OBS cover scaling so overlays and AI tracking never misalign.
 - **🌐 Instant `EN / RU` Language Switcher:** Auto-detects macOS locale on first run (`EN` / `RU`) with a 1-click switcher in both the title bar and top macOS Menu Bar.
 - **📺 Collapsible Live Studio Monitor (`Preview`) + `3×3` Rule-of-Thirds Grid:** View your final color-graded OBS output directly inside `PixelProCam Studio` (0% CPU when collapsed — safely hide OBS with `⌘H`).
 - **🎛 Interactive 2D Framing Trackpad:** Drag the purple crop viewport anywhere to pan in real time; double-click to recenter smoothly.

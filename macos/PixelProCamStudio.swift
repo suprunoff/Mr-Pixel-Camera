@@ -88,6 +88,14 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     @Published var showGridOverlay: Bool = true
     @Published var activeMemorySlot: Int = 0 // 0 = none, 1..3 = M1..M3
     @Published var savedSlotsMask: Set<Int> = []
+    @Published var autoStartObsEnabled: Bool = {
+        if UserDefaults.standard.object(forKey: "mrpixel_autostart_obs") == nil { return true }
+        return UserDefaults.standard.bool(forKey: "mrpixel_autostart_obs")
+    }()
+    @Published var launchAtLoginEnabled: Bool = {
+        let plist = "\(NSHomeDirectory())/Library/LaunchAgents/es.mrmo.MrPixelCamera.plist"
+        return FileManager.default.fileExists(atPath: plist)
+    }()
 
     func tr(_ ru: String, _ en: String) -> String {
         return lang == "ru" ? ru : en
@@ -245,6 +253,9 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         let config = URLSessionConfiguration.default
         urlSession = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
         discoverAdbDeviceSerial()
+        if autoStartObsEnabled && !CommandLine.arguments.contains("--screenshot") {
+            ensureObsRunningInBackground()
+        }
         connectOBS()
         configurePhoneStayAwake()
         checkPixelStatusLight()
@@ -640,6 +651,103 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         if let url = URL(string: "https://mrmo.es") {
             NSWorkspace.shared.open(url)
         }
+    }
+
+    // MARK: - Auto-Launch OBS Studio Headless & macOS Launch at Login
+    func isObsRunning() -> Bool {
+        return NSWorkspace.shared.runningApplications.contains { app in
+            app.bundleIdentifier == "com.obsproject.obs-studio" || app.localizedName == "OBS"
+        }
+    }
+
+    func ensureObsRunningInBackground() {
+        guard !isObsRunning() else { return }
+        let obsAppURL = URL(fileURLWithPath: "/Applications/OBS.app")
+        guard FileManager.default.fileExists(atPath: obsAppURL.path) else {
+            FileLogger.shared.log("OBS-AUTO", "OBS.app not found in /Applications")
+            return
+        }
+        FileLogger.shared.log("OBS-AUTO", "Auto-launching OBS Studio in background (--startvirtualcam --minimize-to-tray)")
+        let cfg = NSWorkspace.OpenConfiguration()
+        cfg.activates = false
+        cfg.hides = true
+        cfg.arguments = ["--startvirtualcam", "--minimize-to-tray"]
+        NSWorkspace.shared.openApplication(at: obsAppURL, configuration: cfg) { [weak self] _, err in
+            if let err = err {
+                FileLogger.shared.log("OBS-ERR", "Failed to auto-launch OBS: \(err.localizedDescription)")
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                    self?.connectOBS()
+                }
+            }
+        }
+    }
+
+    func restartObsEngine() {
+        FileLogger.shared.log("OBS-AUTO", "Restarting OBS Engine with Virtual Camera...")
+        for app in NSWorkspace.shared.runningApplications where app.bundleIdentifier == "com.obsproject.obs-studio" || app.localizedName == "OBS" {
+            app.terminate()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.8) { [weak self] in
+            self?.ensureObsRunningInBackground()
+        }
+    }
+
+    func toggleAutoStartObs(_ enabled: Bool) {
+        autoStartObsEnabled = enabled
+        UserDefaults.standard.set(enabled, forKey: "mrpixel_autostart_obs")
+        FileLogger.shared.log("SYSTEM", "Auto-start OBS in background = \(enabled)")
+        if enabled {
+            ensureObsRunningInBackground()
+        }
+        onStatusChangeForMenuBar?()
+    }
+
+    func toggleLaunchAtLogin(_ enabled: Bool) {
+        let launchAgentsDir = "\(NSHomeDirectory())/Library/LaunchAgents"
+        let plistPath = "\(launchAgentsDir)/es.mrmo.MrPixelCamera.plist"
+
+        if enabled {
+            try? FileManager.default.createDirectory(atPath: launchAgentsDir, withIntermediateDirectories: true)
+            let appPath = Bundle.main.bundlePath.hasSuffix(".app")
+                ? Bundle.main.bundlePath
+                : "\(NSHomeDirectory())/Desktop/PixelProCam/Mr. Pixel Camera.app"
+
+            let plistContent = """
+            <?xml version="1.0" encoding="UTF-8"?>
+            <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+            <plist version="1.0">
+            <dict>
+                <key>Label</key>
+                <string>es.mrmo.MrPixelCamera</string>
+                <key>ProgramArguments</key>
+                <array>
+                    <string>/usr/bin/open</string>
+                    <string>-g</string>
+                    <string>\(appPath)</string>
+                    <string>--args</string>
+                    <string>--background</string>
+                </array>
+                <key>RunAtLoad</key>
+                <true/>
+                <key>KeepAlive</key>
+                <false/>
+            </dict>
+            </plist>
+            """
+            do {
+                try plistContent.write(toFile: plistPath, atomically: true, encoding: .utf8)
+                launchAtLoginEnabled = true
+                FileLogger.shared.log("SYSTEM", "Enabled Launch at macOS Login (\(plistPath))")
+            } catch {
+                FileLogger.shared.log("SYS-ERR", "Failed to write LaunchAgent: \(error.localizedDescription)")
+            }
+        } else {
+            try? FileManager.default.removeItem(atPath: plistPath)
+            launchAtLoginEnabled = false
+            FileLogger.shared.log("SYSTEM", "Disabled Launch at macOS Login")
+        }
+        onStatusChangeForMenuBar?()
     }
 
     // MARK: - Apple Vision Neural Engine AI Auto-Framing
@@ -2351,8 +2459,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         window.backgroundColor = NSColor(calibratedRed: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: contentView)
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+
+        if !CommandLine.arguments.contains("--background") {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
 
         if CommandLine.arguments.contains("--screenshot") {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -2571,6 +2682,30 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         menu.addItem(NSMenuItem.separator())
 
+        // System Auto-Start Submenu
+        let sysMenu = NSMenu()
+        let autoObsItem = NSMenuItem(title: ctrl.tr("🚀 Авто-старт OBS (Фон + VirtualCam)", "🚀 Auto-Launch OBS (Background + VirtualCam)"), action: #selector(menuToggleAutoObs), keyEquivalent: "")
+        autoObsItem.target = self
+        autoObsItem.state = ctrl.autoStartObsEnabled ? .on : .off
+        sysMenu.addItem(autoObsItem)
+
+        let loginItem = NSMenuItem(title: ctrl.tr("⚡ Запускать при входе в macOS", "⚡ Launch at macOS Login"), action: #selector(menuToggleLogin), keyEquivalent: "")
+        loginItem.target = self
+        loginItem.state = ctrl.launchAtLoginEnabled ? .on : .off
+        sysMenu.addItem(loginItem)
+
+        sysMenu.addItem(NSMenuItem.separator())
+
+        let restartObsItem = NSMenuItem(title: ctrl.tr("🔄 Перезапустить OBS Engine", "🔄 Restart OBS Engine"), action: #selector(menuRestartObs), keyEquivalent: "")
+        restartObsItem.target = self
+        sysMenu.addItem(restartObsItem)
+
+        let sysParent = NSMenuItem(title: ctrl.tr("⚙️ Автозапуск и Система", "⚙️ Auto-Start & System"), action: nil, keyEquivalent: "")
+        sysParent.submenu = sysMenu
+        menu.addItem(sysParent)
+
+        menu.addItem(NSMenuItem.separator())
+
         let siteItem = NSMenuItem(title: "🌐 mrmo.es", action: #selector(menuOpenSite), keyEquivalent: "")
         siteItem.target = self
         menu.addItem(siteItem)
@@ -2598,6 +2733,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func menuToggleLetterbox() { ctrl.setCinemaLetterbox(!ctrl.letterboxEnabled) }
     @objc func menuSet60Fps() { ctrl.setCameraFpsMode(use60Fps: true) }
     @objc func menuSet30Fps() { ctrl.setCameraFpsMode(use60Fps: false) }
+    @objc func menuToggleAutoObs() { ctrl.toggleAutoStartObs(!ctrl.autoStartObsEnabled) }
+    @objc func menuToggleLogin() { ctrl.toggleLaunchAtLogin(!ctrl.launchAtLoginEnabled) }
+    @objc func menuRestartObs() { ctrl.restartObsEngine() }
     @objc func menuOpenSite() { ctrl.openAuthorWebsite() }
     @objc func menuQuit() { NSApp.terminate(nil) }
 
