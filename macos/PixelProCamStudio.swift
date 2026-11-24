@@ -208,10 +208,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     private var colorUpdateWorkItem: DispatchWorkItem?
     private var lutUpdateWorkItem: DispatchWorkItem?
     private var syncUpdateWorkItem: DispatchWorkItem?
-    private var hasCompletedInitialPixelPoll: Bool = false
-    private var lastAutoUvcSwitchTime: Date = .distantPast
     private var lastAdbHealTime: Date = .distantPast
-    private var pixelWasInUvcMode: Bool = false
 
     let adbPath: String = {
         let bundled = Bundle.main.bundlePath + "/Contents/MacOS/adb"
@@ -1397,20 +1394,6 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         }
     }
 
-    private func autoEnablePixelWebcamMode() {
-        guard Date().timeIntervalSince(lastAutoUvcSwitchTime) > 15.0 else { return }
-        lastAutoUvcSwitchTime = Date()
-        FileLogger.shared.log("USB-AUTO", tr("Pixel подключён без режима камеры — автоматически включаю USB Веб-камеру...", "Pixel detected outside Webcam mode — auto-enabling USB Webcam (UVC)..."))
-        runADBCommand("svc usb setScreenUnlockedFunctions uvc && svc usb setFunctions uvc")
-        // After USB re-enumeration, auto-heal ADB if offline and ensure OBS captures live video
-        DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) { [weak self] in
-            guard let self = self else { return }
-            self.lastAdbHealTime = .distantPast
-            self.healOfflineAdbIfNeeded()
-            self.reconnectCameraAndVirtualCam()
-        }
-    }
-
     func checkPixelStatusLight() {
         DispatchQueue.global(qos: .utility).async {
             let ioTask = Process()
@@ -1445,7 +1428,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         DispatchQueue.global(qos: .utility).async {
             let task = Process()
             task.executableURL = URL(fileURLWithPath: self.adbPath)
-            task.arguments = ["-s", self.pixelSerial, "shell", "dumpsys window | grep mCurrentFocus ; dumpsys battery | grep -E 'level:|temperature:' ; echo USBFUNC:$(svc usb getFunctions)"]
+            task.arguments = ["-s", self.pixelSerial, "shell", "dumpsys window | grep mCurrentFocus ; dumpsys battery | grep -E 'level:|temperature:'"]
             let pipe = Pipe()
             task.standardOutput = pipe
             task.standardError = Pipe()
@@ -1463,7 +1446,6 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 let out = String(data: data, encoding: .utf8) ?? ""
                 let connected = !out.isEmpty
                 let unlocked = !out.contains("NotificationShade") && !out.contains("Keyguard")
-                var isUvcMode = false
 
                 var batt = self.pixelBatteryLevel
                 var temp = self.pixelTempC
@@ -1473,9 +1455,6 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                         batt = val
                     } else if trimmed.hasPrefix("temperature:"), let val = Double(trimmed.replacingOccurrences(of: "temperature:", with: "").trimmingCharacters(in: .whitespaces)) {
                         temp = val / 10.0
-                    } else if trimmed.hasPrefix("USBFUNC:") {
-                        let fn = trimmed.replacingOccurrences(of: "USBFUNC:", with: "").lowercased()
-                        isUvcMode = fn.contains("uvc")
                     }
                 }
 
@@ -1484,21 +1463,12 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                         self.healOfflineAdbIfNeeded()
                     }
                     let wasDisconnected = !self.pixelConnected
-                    let wasNotUvc = !self.pixelWasInUvcMode
-                    let isHotPlugUvc = self.hasCompletedInitialPixelPoll && connected && isUvcMode && (wasDisconnected || wasNotUvc)
-                    self.hasCompletedInitialPixelPoll = true
-                    self.pixelWasInUvcMode = connected && isUvcMode
-
                     if self.pixelConnected != connected {
                         self.pixelConnected = connected
-                    }
-                    if connected && !isUvcMode {
-                        // Zero-click startup: automatically switch Pixel 10 Pro into USB Webcam mode!
-                        self.autoEnablePixelWebcamMode()
-                    } else if isHotPlugUvc && Date().timeIntervalSince(self.lastAutoUvcSwitchTime) > 10.0 {
-                        // Auto-recover OBS UVC capture when Pixel 10 Pro is hot-plugged in UVC mode
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
-                            self.reconnectCameraAndVirtualCam()
+                        if connected && wasDisconnected && self.obsConnected {
+                            // Never yank OBS device or reset Pixel USB gadget on reconnect —
+                            // OBS macos-avcapture-fast natively reconnects UVC; only ensure VirtualCam is up.
+                            self.sendOBSRequest(type: "StartVirtualCam", data: [:], id: "ensure_vcam_hotplug")
                         }
                     }
                     if connected && self.pixelScreenUnlocked != unlocked {
