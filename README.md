@@ -56,15 +56,15 @@ Third-party webcam apps (`Camo`, `Iriun`, `DroidCam`) force you to install a hea
 
 ---
 
-## 🎚 Companion App: Mr. Audio Meters v2.5 (RØDE NT1 5th Gen Studio)
+## 🎚 Companion App: Mr. Audio Meters v2.6 (RØDE NT1 5th Gen Studio)
 
 <p align="center">
-  <img src="assets/screenshots/audio_meters_quad.png" alt="Mr. Audio Meters v2.5 Studio Analyzer & Direct RØDE NT1 DSP" width="760">
+  <img src="assets/screenshots/audio_meters_quad.png" alt="Mr. Audio Meters v2.6 Studio Analyzer & Direct RØDE NT1 DSP" width="760">
 </p>
 
-Included alongside `Mr. Pixel Camera` (launchable in 1 click via the **`Meters`** button or standalone):
-- **MiniMeters + FabFilter Pro-Q 4 + TDR Prism + Youlean Loudness UI:** Multi-band frequency-colored waveform with live Noise Gate threshold line, 64-band smooth vector FFT spectrum (`0 / +3 / +4.5 dB/oct` tilt + Vocal Target Curve), Mel spectrogram waterfall, pitch-locked oscilloscope, Lissajous stereometer, and scrolling EBU R128 LUFS history.
-- **Direct RØDE NT1 5th Gen Hardware Control (`IOKit USB HID` + `CoreAudio HAL`):** Real-time bi-directional control of onboard `Input Gain`, `HPF (Off / 75 / 150 Hz)`, `Noise Gate` (with live `OPEN / CLOSED` indicator), `Compressor`, `APHEX Big Bottom™`, and `APHEX Aural Exciter™` — plus **A / B** comparison slots, **Room Acoustic Profiles** (`Construction`, `Quiet Studio`, `Echo`, `Office`), **Mic Voice Presets** (`Radio`, `Podcast`, `Calls`, `Bright`, `ASMR`, `Raw`), **5s Noise Auto-Scanner**, **Clap RT60 Room Echo Test**, **5s Instant Headphone Voice Check**, **OBS AI RNNoise** turbo integration, **macOS System Audio (`ScreenCaptureKit`)** mode, and global **`⌘⇧M` Hardware Mute**.
+Included alongside `Mr. Pixel Camera` (installed to `/Applications` and launchable in 1 click via the **`Meters`** button or standalone):
+- **MiniMeters + FabFilter Pro-Q 4 + TDR Prism + Youlean Loudness UI (Ultra-Low CPU):** Isolated `MeterStreamState` pure-`Canvas` rendering (`< 5% CPU`), multi-band frequency-colored waveform with live Noise Gate threshold line, 64-band smooth vector FFT spectrum (`0 / +3 / +4.5 dB/oct` tilt + Vocal Target Curve), Mel spectrogram waterfall, pitch-locked oscilloscope, Lissajous stereometer, and scrolling EBU R128 LUFS history.
+- **Direct RØDE NT1 5th Gen Hardware Control (`IOKit USB HID` + `CoreAudio HAL`):** Real-time bi-directional control of onboard `Input Gain`, `HPF (Off / 75 / 150 Hz)`, `Noise Gate` (with live `OPEN / CLOSED` indicator + `Fine DSP` Attack/Hold/Hysteresis), `Compressor` (+ Attack/Release/Make-up), `APHEX Big Bottom™`, and `APHEX Aural Exciter™` — plus live **`24-bit` / `32-bit Float`** USB stream detection, **A / B** comparison slots, **Room Acoustic Profiles** (`Construction`, `Quiet Studio`, `Echo`, `Office`), **Mic Voice Presets** (`Radio`, `Podcast`, `Calls`, `Bright`, `ASMR`, `Raw`), **5s Noise Auto-Scanner**, **Clap RT60 Room Echo Test**, **5s Instant Headphone Voice Check**, **OBS AI RNNoise** turbo integration (with automatic `-15 ms` Lip-Sync compensation), **macOS System Audio (`ScreenCaptureKit`)** mode, and global **`⌘⇧M` Hardware Mute**.
 
 ---
 
@@ -84,7 +84,7 @@ chmod +x install.sh
 ./install.sh
 ```
 
-`install.sh` automatically copies all 3D LUTs, custom cinema GPU shaders, and optical overlays into OBS Studio, compiles the native **`Mr. Pixel Camera.app`** bundle using `/usr/bin/swiftc`, enables OBS WebSocket on port `4455`, and launches the studio deck.
+`install.sh` automatically copies all 3D LUTs, custom cinema GPU shaders, and optical overlays into OBS Studio, compiles both native **`Mr. Pixel Camera.app`** and **`Mr. Audio Meters.app`** bundles using `/usr/bin/swiftc`, installs them into `/Applications`, enables OBS WebSocket on port `4455`, and launches the studio suite.
 
 ### Recommended Apple Silicon OBS Plugins (Optional for GPU Shaders & Transitions)
 - [`obs-shaderfilter`](https://github.com/exeldro/obs-shaderfilter) — powers `Black Pro-Mist 1/4` optical halation & `Kodak 35mm Film Grain` shaders

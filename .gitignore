@@ -1,8 +1,10 @@
 .DS_Store
 pixelprocam_debug.log
 PixelProCamStudio
+MrAudioMeters
 PixelProCam Studio.app/
 Mr. Pixel Camera.app/
+Mr. Audio Meters.app/
 bin/
 Captures/
 android/.gradle/

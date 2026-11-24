@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-echo "🎬 Installing Mr. Pixel Camera v2.2 + Mr. Audio Meters v2.5 for macOS (by mrmo.es)..."
+echo "🎬 Installing Mr. Pixel Camera v2.2 + Mr. Audio Meters v2.6 for macOS (by mrmo.es)..."
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS_LUT_DIR="$HOME/Library/Application Support/obs-studio/LUTs"
@@ -88,9 +88,9 @@ cat > "$AUD_BUNDLE/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.5</string>
+    <string>2.6</string>
     <key>CFBundleVersion</key>
-    <string>25</string>
+    <string>26</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
@@ -103,7 +103,7 @@ cat > "$AUD_BUNDLE/Contents/Info.plist" << 'EOF'
 </plist>
 EOF
 
-echo "⚙️ Compiling Mr. Audio Meters v2.5 (Accelerate vDSP + IOKit HID + ScreenCaptureKit + Carbon)..."
+echo "⚙️ Compiling Mr. Audio Meters v2.6 (Accelerate vDSP + IOKit HID + ScreenCaptureKit + Carbon)..."
 /usr/bin/swiftc -O "$REPO_DIR/macos/MrAudioMeters.swift" \
     -o "$AUD_BUNDLE/Contents/MacOS/MrAudioMeters" \
     -framework Cocoa -framework SwiftUI -framework AVFoundation -framework CoreAudio \
@@ -114,7 +114,15 @@ codesign --force --deep --sign - "$AUD_BUNDLE" >/dev/null 2>&1 || true
 touch "$AUD_BUNDLE"
 echo "✅ Built: $AUD_BUNDLE"
 
-# 4. Ensure OBS WebSocket v5 server is enabled on port 4455 (local loopback)
+# 4. Sync both apps into /Applications (for Spotlight, Raycast & Launchpad!)
+if [ -w "/Applications" ]; then
+    rm -rf "/Applications/Mr. Pixel Camera.app" "/Applications/Mr. Audio Meters.app"
+    ditto "$CAM_BUNDLE" "/Applications/Mr. Pixel Camera.app"
+    ditto "$AUD_BUNDLE" "/Applications/Mr. Audio Meters.app"
+    echo "✅ Installed into /Applications: Mr. Pixel Camera.app & Mr. Audio Meters.app"
+fi
+
+# 5. Ensure OBS WebSocket v5 server is enabled on port 4455 (local loopback)
 OBS_WS_CFG="$HOME/Library/Application Support/obs-studio/plugin_config/obs-websocket/config.json"
 if [ -d "$(dirname "$OBS_WS_CFG")" ]; then
     cat > "$OBS_WS_CFG" << 'EOF'
@@ -131,5 +139,10 @@ EOF
 fi
 
 echo "🚀 Launching Mr. Pixel Camera.app & Mr. Audio Meters.app..."
-open "$CAM_BUNDLE"
-open "$AUD_BUNDLE"
+if [ -d "/Applications/Mr. Pixel Camera.app" ]; then
+    open "/Applications/Mr. Pixel Camera.app"
+    open "/Applications/Mr. Audio Meters.app"
+else
+    open "$CAM_BUNDLE"
+    open "$AUD_BUNDLE"
+fi
