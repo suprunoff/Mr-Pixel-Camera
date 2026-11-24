@@ -659,6 +659,92 @@ struct RoomAudioProfile: Codable, Identifiable, Equatable {
     ]
 }
 
+// MARK: - Mic / Vocal Character Presets for RØDE NT1 5th Gen (Composes with Room Presets!)
+struct MicVoicePreset: Codable, Identifiable, Equatable {
+    var id: String
+    var name: String
+    var icon: String
+    var isBuiltIn: Bool
+    var subtitle: String
+    var compEnabled: Bool
+    var compThresholdDb: Double
+    var compRatio: Double
+    var compAttackMs: Double
+    var compReleaseMs: Double
+    var compGainDb: Double
+    var bigBottomEnabled: Bool
+    var bigBottomDrivePct: Double
+    var bigBottomTuneHz: Double
+    var exciterEnabled: Bool
+    var exciterMixPct: Double
+    var exciterTuneHz: Double
+    // Optional full snapshot for custom user mic presets
+    var fullDspOverride: RodeDSPSettings? = nil
+
+    static let builtInPresets: [MicVoicePreset] = [
+        MicVoicePreset(
+            id: "mic_radio",
+            name: "Радио / Диктор",
+            icon: "radio.fill",
+            isBuiltIn: true,
+            subtitle: "Плотный бархат • Comp 2.8:1 (+3.5 dB) • Big Bottom 72% • Exciter 65%",
+            compEnabled: true, compThresholdDb: -26.0, compRatio: 2.8, compAttackMs: 0.6, compReleaseMs: 20.0, compGainDb: 3.5,
+            bigBottomEnabled: true, bigBottomDrivePct: 72.0, bigBottomTuneHz: 85.0,
+            exciterEnabled: true, exciterMixPct: 65.0, exciterTuneHz: 3500.0
+        ),
+        MicVoicePreset(
+            id: "mic_podcast",
+            name: "Подкаст",
+            icon: "mic.fill",
+            isBuiltIn: true,
+            subtitle: "Сбалансированный студийный • Comp 2.1:1 (+2.0 dB) • Big Bottom 52% • Exciter 58%",
+            compEnabled: true, compThresholdDb: -24.0, compRatio: 2.1, compAttackMs: 0.8, compReleaseMs: 25.0, compGainDb: 2.0,
+            bigBottomEnabled: true, bigBottomDrivePct: 52.0, bigBottomTuneHz: 90.0,
+            exciterEnabled: true, exciterMixPct: 58.0, exciterTuneHz: 3500.0
+        ),
+        MicVoicePreset(
+            id: "mic_calls",
+            name: "Созвоны / Meet",
+            icon: "video.fill",
+            isBuiltIn: true,
+            subtitle: "Чёткая разборчивость речи • Comp 2.3:1 • Сдержанный бас 25% • Exciter 62%",
+            compEnabled: true, compThresholdDb: -22.0, compRatio: 2.3, compAttackMs: 0.7, compReleaseMs: 22.0, compGainDb: 2.0,
+            bigBottomEnabled: true, bigBottomDrivePct: 25.0, bigBottomTuneHz: 105.0,
+            exciterEnabled: true, exciterMixPct: 62.0, exciterTuneHz: 3100.0
+        ),
+        MicVoicePreset(
+            id: "mic_bright",
+            name: "Яркий голос",
+            icon: "sun.max.fill",
+            isBuiltIn: true,
+            subtitle: "Воздух и чёткость дикции • Comp 2.2:1 (+2.5 dB) • Exciter 78% @ 4.0 kHz",
+            compEnabled: true, compThresholdDb: -23.0, compRatio: 2.2, compAttackMs: 0.7, compReleaseMs: 24.0, compGainDb: 2.5,
+            bigBottomEnabled: true, bigBottomDrivePct: 35.0, bigBottomTuneHz: 95.0,
+            exciterEnabled: true, exciterMixPct: 78.0, exciterTuneHz: 4000.0
+        ),
+        MicVoicePreset(
+            id: "mic_asmr",
+            name: "Мягкий / ASMR",
+            icon: "ear.fill",
+            isBuiltIn: true,
+            subtitle: "Интимная подача и шёпот • Мягкий Comp 1.7:1 (+3.0 dB) • Exciter 70% @ 4.2 kHz",
+            compEnabled: true, compThresholdDb: -28.0, compRatio: 1.7, compAttackMs: 1.5, compReleaseMs: 40.0, compGainDb: 3.0,
+            bigBottomEnabled: true, bigBottomDrivePct: 45.0, bigBottomTuneHz: 80.0,
+            exciterEnabled: true, exciterMixPct: 70.0, exciterTuneHz: 4200.0
+        ),
+        MicVoicePreset(
+            id: "mic_raw",
+            name: "Чистый / Raw",
+            icon: "waveform",
+            isBuiltIn: true,
+            subtitle: "Без окраса APHEX (Comp / Big Bottom / Exciter OFF) — для вокала и DAW",
+            compEnabled: false, compThresholdDb: -24.0, compRatio: 2.0, compAttackMs: 0.8, compReleaseMs: 25.0, compGainDb: 0.0,
+            bigBottomEnabled: false, bigBottomDrivePct: 0.0, bigBottomTuneHz: 90.0,
+            exciterEnabled: false, exciterMixPct: 0.0, exciterTuneHz: 3500.0
+        )
+    ]
+}
+
 // MARK: - ITU-R BS.1770-4 K-Weighting Biquads (@ 48 kHz)
 struct BiquadFilter {
     var b0: Float; var b1: Float; var b2: Float
@@ -813,6 +899,8 @@ struct AudioMetersConfig: Codable {
     var autoAdaptiveGuard: Bool
     var activeProfileId: String?
     var customProfiles: [RoomAudioProfile]
+    var activeMicPresetId: String?
+    var customMicPresets: [MicVoicePreset]?
     var windowOpacity: Double
     var lang: String
     var windowX: Double?
@@ -890,7 +978,14 @@ final class AudioAnalyzerEngine: ObservableObject {
     @Published var showSaveRoomPopover: Bool = false
     @Published var newRoomName: String = ""
 
+    // Mic / Vocal Character Presets (RØDE APHEX Voice Presets)
+    @Published var customMicPresets: [MicVoicePreset] = []
+    @Published var activeMicPresetId: String = ""
+    @Published var showSaveMicPresetPopover: Bool = false
+    @Published var newMicPresetName: String = ""
+
     var allProfiles: [RoomAudioProfile] { RoomAudioProfile.builtInProfiles + customProfiles }
+    var allMicPresets: [MicVoicePreset] { MicVoicePreset.builtInPresets + customMicPresets }
 
     // Real-Time Meter Buffers (60 Hz)
     static let spectrumBins = 64
@@ -1068,6 +1163,8 @@ final class AudioAnalyzerEngine: ObservableObject {
         autoAdaptiveGuard = c.autoAdaptiveGuard
         activeProfileId = c.activeProfileId ?? ""
         customProfiles = c.customProfiles
+        activeMicPresetId = c.activeMicPresetId ?? ""
+        customMicPresets = c.customMicPresets ?? []
         windowOpacity = max(0.65, min(1.0, c.windowOpacity))
         lang = c.lang
         if let x = c.windowX, let y = c.windowY, let w = c.windowW, let h = c.windowH {
@@ -1104,6 +1201,8 @@ final class AudioAnalyzerEngine: ObservableObject {
             autoAdaptiveGuard: autoAdaptiveGuard,
             activeProfileId: activeProfileId,
             customProfiles: customProfiles,
+            activeMicPresetId: activeMicPresetId,
+            customMicPresets: customMicPresets,
             windowOpacity: windowOpacity,
             lang: lang,
             windowX: savedWindowFrame.map { Double($0.origin.x) },
@@ -1139,6 +1238,7 @@ final class AudioAnalyzerEngine: ObservableObject {
         if previousRodeDsp == nil { previousRodeDsp = rodeDsp }
         mutate(&rodeDsp)
         activeProfileId = ""
+        activeMicPresetId = ""
         scheduleRodeHardwareWrite(immediate: false)
     }
 
@@ -1220,6 +1320,80 @@ final class AudioAnalyzerEngine: ObservableObject {
     func deleteCustomRoom(_ id: String) {
         customProfiles.removeAll { $0.id == id }
         if activeProfileId == id { activeProfileId = "" }
+        scheduleSaveConfig()
+    }
+
+    // MARK: - Mic / Vocal Character Presets (Preserves Active Room HPF & Noise Gate!)
+    func applyMicVoicePreset(_ preset: MicVoicePreset) {
+        activeMicPresetId = preset.id
+        var next = rodeDsp
+        if let full = preset.fullDspOverride {
+            // Custom user mic preset restores its saved full DSP snapshot
+            next = full
+            applyRodeSettingsNow(next, label: tr("Мик: \(preset.name)", "Mic: \(preset.name)"))
+        } else {
+            // Built-in voice presets layer cleanly over your Room's HPF & Noise Gate!
+            next.compEnabled = preset.compEnabled
+            next.compThresholdDb = preset.compThresholdDb
+            next.compRatio = preset.compRatio
+            next.compAttackMs = preset.compAttackMs
+            next.compReleaseMs = preset.compReleaseMs
+            next.compGainDb = preset.compGainDb
+            next.exciterEnabled = preset.exciterEnabled
+            next.exciterMixPct = preset.exciterMixPct
+            next.exciterTuneHz = preset.exciterTuneHz
+
+            let inConstruction = (activeProfileId == "builtin_construction")
+            if inConstruction && preset.bigBottomEnabled {
+                // Keep construction rumble protection intact while still giving warmth
+                next.bigBottomEnabled = true
+                next.bigBottomDrivePct = min(28.0, preset.bigBottomDrivePct)
+                next.bigBottomTuneHz = max(95.0, preset.bigBottomTuneHz)
+                applyRodeSettingsNow(next, label: tr("Голос: \(preset.name) (HPF/Gate стройки сохранены)", "Voice: \(preset.name) (room guard kept)"))
+            } else {
+                next.bigBottomEnabled = preset.bigBottomEnabled
+                next.bigBottomDrivePct = preset.bigBottomDrivePct
+                next.bigBottomTuneHz = preset.bigBottomTuneHz
+                applyRodeSettingsNow(next, label: tr("Голос: \(preset.name)", "Voice: \(preset.name)"))
+            }
+        }
+        scheduleSaveConfig()
+    }
+
+    func saveCurrentAsCustomMicPreset(name: String) {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+        let preset = MicVoicePreset(
+            id: "mic_custom_\(UUID().uuidString.prefix(8))",
+            name: trimmed,
+            icon: "dial.high.fill",
+            isBuiltIn: false,
+            subtitle: "Gain \(Int(rodeDsp.inputGainDb))dB • HPF \(rodeDsp.hpfLabel) • Comp \(String(format: "%.1f", rodeDsp.compRatio)):1 • BB \(Int(rodeDsp.bigBottomDrivePct))% • AE \(Int(rodeDsp.exciterMixPct))%",
+            compEnabled: rodeDsp.compEnabled,
+            compThresholdDb: rodeDsp.compThresholdDb,
+            compRatio: rodeDsp.compRatio,
+            compAttackMs: rodeDsp.compAttackMs,
+            compReleaseMs: rodeDsp.compReleaseMs,
+            compGainDb: rodeDsp.compGainDb,
+            bigBottomEnabled: rodeDsp.bigBottomEnabled,
+            bigBottomDrivePct: rodeDsp.bigBottomDrivePct,
+            bigBottomTuneHz: rodeDsp.bigBottomTuneHz,
+            exciterEnabled: rodeDsp.exciterEnabled,
+            exciterMixPct: rodeDsp.exciterMixPct,
+            exciterTuneHz: rodeDsp.exciterTuneHz,
+            fullDspOverride: rodeDsp
+        )
+        customMicPresets.append(preset)
+        activeMicPresetId = preset.id
+        newMicPresetName = ""
+        showSaveMicPresetPopover = false
+        scheduleSaveConfig()
+        showToast(tr("💾 Пресет мик. «\(trimmed)» сохранён", "💾 Mic preset '\(trimmed)' saved"))
+    }
+
+    func deleteCustomMicPreset(_ id: String) {
+        customMicPresets.removeAll { $0.id == id }
+        if activeMicPresetId == id { activeMicPresetId = "" }
         scheduleSaveConfig()
     }
 
@@ -1925,6 +2099,7 @@ final class AudioAnalyzerEngine: ObservableObject {
         rodeConnected = true
         activeDeviceName = "RØDE NT1 5th Gen"
         activeProfileId = "builtin_construction"
+        activeMicPresetId = "mic_radio"
         rodeDsp = RoomAudioProfile.builtInProfiles[0].dsp
         liveNoiseStatus = "⚠ Шум/Стройка"
         peakDb = -6.8; peakHoldDb = -5.2; rmsDb = -15.4
@@ -1979,12 +2154,11 @@ struct AudioMetersView: View {
         VStack(spacing: 0) {
             // ROW 1: Main Studio Controls Toolbar (Clean, No Frameless Overlap!)
             HStack(spacing: 8) {
-                if let logoPath = Bundle.main.path(forResource: "mo_logo", ofType: "png"),
+                if let logoPath = Bundle.main.path(forResource: "mo_audio_logo", ofType: "png") ?? Bundle.main.path(forResource: "mo_logo", ofType: "png"),
                    let nsImg = NSImage(contentsOfFile: logoPath) {
                     Image(nsImage: nsImg)
                         .resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 20, height: 20)
-                        .clipShape(RoundedRectangle(cornerRadius: 4.5, style: .continuous))
+                        .frame(width: 24, height: 24)
                 }
 
                 // Input Device Picker
@@ -2508,6 +2682,79 @@ struct RodeDSPDrawerView: View {
             }
             .padding(.horizontal, 10).padding(.top, 7)
 
+            // Mic / Vocal Tone Presets Strip (Layers over Room Noise Presets!)
+            HStack(spacing: 6) {
+                Text(eng.tr("МИК ПРЕСЕТЫ:", "MIC PRESETS:"))
+                    .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
+                    .foregroundColor(.secondary)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 5) {
+                        ForEach(eng.allMicPresets) { preset in
+                            let isActive = eng.activeMicPresetId == preset.id
+                            HStack(spacing: 3) {
+                                Button(action: { eng.applyMicVoicePreset(preset) }) {
+                                    HStack(spacing: 3.5) {
+                                        Image(systemName: preset.icon).font(.system(size: 9))
+                                        Text(preset.name).font(.system(size: 9.5, weight: isActive ? .bold : .semibold))
+                                    }
+                                    .padding(.horizontal, 7.5).padding(.vertical, 3)
+                                    .background(isActive ? eng.theme.secondary.opacity(0.32) : Color.white.opacity(0.055))
+                                    .foregroundColor(isActive ? Color(red: 0.86, green: 0.72, blue: 1.0) : .primary.opacity(0.85))
+                                    .overlay(RoundedRectangle(cornerRadius: 4.5).stroke(isActive ? eng.theme.secondary.opacity(0.85) : Color.clear, lineWidth: 1))
+                                    .cornerRadius(4.5)
+                                }
+                                .buttonStyle(.plain)
+                                .help(preset.subtitle)
+
+                                if !preset.isBuiltIn {
+                                    Button(action: { eng.deleteCustomMicPreset(preset.id) }) {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.system(size: 9))
+                                            .foregroundColor(.secondary.opacity(0.7))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .help(eng.tr("Удалить пресет", "Delete preset"))
+                                }
+                            }
+                        }
+
+                        // + Save Custom Mic DSP Preset
+                        Button(action: { eng.showSaveMicPresetPopover.toggle() }) {
+                            HStack(spacing: 2.5) {
+                                Image(systemName: "plus")
+                                Text(eng.tr("Пресет", "Preset"))
+                            }
+                            .font(.system(size: 9.5, weight: .semibold))
+                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .background(Color.white.opacity(0.06))
+                            .foregroundColor(.secondary)
+                            .cornerRadius(4.5)
+                        }
+                        .buttonStyle(.plain)
+                        .popover(isPresented: $eng.showSaveMicPresetPopover, arrowEdge: .top) {
+                            VStack(alignment: .leading, spacing: 8) {
+                                Text(eng.tr("Сохранить пресет микрофона", "Save RØDE Mic Preset"))
+                                    .font(.system(size: 12, weight: .bold))
+                                Text(eng.tr("Сохранит текущие настройки Gain, HPF, Gate, Compressor, Big Bottom и Exciter.", "Saves all current RØDE NT1 hardware DSP settings."))
+                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                                TextField(eng.tr("Напр.: Мой дикторский, Стрим, Вокал...", "e.g. Broadcast, Stream, Vocal..."), text: $eng.newMicPresetName)
+                                    .textFieldStyle(.roundedBorder).frame(width: 235)
+                                HStack {
+                                    Spacer()
+                                    Button(eng.tr("Отмена", "Cancel")) { eng.showSaveMicPresetPopover = false }.controlSize(.small)
+                                    Button(eng.tr("Сохранить", "Save")) { eng.saveCurrentAsCustomMicPreset(name: eng.newMicPresetName) }
+                                        .buttonStyle(.borderedProminent).controlSize(.small)
+                                        .disabled(eng.newMicPresetName.trimmingCharacters(in: .whitespaces).isEmpty)
+                                }
+                            }
+                            .padding(12)
+                        }
+                    }
+                }
+            }
+            .padding(.horizontal, 10)
+
             // 5 Hardware DSP Channel Cards Side-by-Side
             HStack(spacing: 7) {
                 // 1. Preamp Gain + HPF
@@ -2879,8 +3126,8 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     private func idealSize(for mode: MeterLayoutMode, drawer: Bool) -> NSSize {
         let baseH: CGFloat = mode == .quad ? 400 : 215
-        let extra: CGFloat = drawer ? 148 : 0
-        let w: CGFloat = mode == .quad ? 980 : 1080
+        let extra: CGFloat = drawer ? 178 : 0
+        let w: CGFloat = mode == .quad ? 995 : 1080
         return NSSize(width: w, height: baseH + extra)
     }
 
@@ -2894,7 +3141,7 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         if isShotBar {
             defaultFrame = NSRect(x: 100, y: 100, width: 1080, height: 225)
         } else if isShotQuad {
-            defaultFrame = NSRect(x: 100, y: 100, width: 990, height: 555)
+            defaultFrame = NSRect(x: 100, y: 100, width: 995, height: 585)
         } else if let saved = eng.savedWindowFrame,
                   NSScreen.screens.contains(where: { $0.visibleFrame.intersects(saved) }) {
             defaultFrame = saved
@@ -3014,6 +3261,17 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         }
 
         menu.addItem(NSMenuItem.separator())
+        let micHdr = NSMenuItem(title: eng.tr("🎙 Пресеты микрофона (RØDE)", "🎙 Mic Voice Presets (RØDE)"), action: nil, keyEquivalent: "")
+        micHdr.isEnabled = false
+        menu.addItem(micHdr)
+        for mp in eng.allMicPresets {
+            let item = NSMenuItem(title: (eng.activeMicPresetId == mp.id ? "✓ " : "   ") + mp.name, action: #selector(pickMicPreset(_:)), keyEquivalent: "")
+            item.representedObject = mp.id
+            item.target = self
+            menu.addItem(item)
+        }
+
+        menu.addItem(NSMenuItem.separator())
         let pinItem = NSMenuItem(title: eng.tr("📌 Поверх всех окон (Full-Screen)", "📌 Always on Top"), action: #selector(togglePin), keyEquivalent: "")
         pinItem.target = self; pinItem.state = eng.alwaysOnTop ? .on : .off; menu.addItem(pinItem)
 
@@ -3034,6 +3292,11 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
     @objc func pickProfile(_ sender: NSMenuItem) {
         if let id = sender.representedObject as? String, let p = eng.allProfiles.first(where: { $0.id == id }) {
             eng.applyRoomProfile(p)
+        }
+    }
+    @objc func pickMicPreset(_ sender: NSMenuItem) {
+        if let id = sender.representedObject as? String, let mp = eng.allMicPresets.first(where: { $0.id == id }) {
+            eng.applyMicVoicePreset(mp)
         }
     }
     @objc func togglePin() { eng.setAlwaysOnTop(!eng.alwaysOnTop) }
