@@ -22,7 +22,7 @@ final class FileLogger {
     var onNewLogLine: ((String) -> Void)?
 
     private init() {
-        let header = "=== PixelProCam Studio v2.1 Diagnostic Log Started at \(Date()) ===\n"
+        let header = "=== Mr. Pixel Camera v2.2 Diagnostic Log Started at \(Date()) ===\n"
         try? header.write(toFile: logFilePath, atomically: true, encoding: .utf8)
     }
 
@@ -61,6 +61,8 @@ struct StudioMemorySlot: Codable {
     var lutIntensity: Double
     var vignetteEnabled: Bool
     var letterboxEnabled: Bool
+    var proMistEnabled: Bool?
+    var filmGrainEnabled: Bool?
     var zoomLevel: Double
     var panX: Double
     var panY: Double
@@ -73,7 +75,7 @@ struct StudioMemorySlot: Codable {
     var sharpness: Double
 }
 
-// MARK: - Studio Controller v2.1
+// MARK: - Studio Controller v2.2
 final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDelegate {
     // Localization (EN / RU) & UI Modes
     @Published var lang: String = {
@@ -168,19 +170,21 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     private var recordTimer: Timer?
     let capturesDir = "\(NSHomeDirectory())/Desktop/PixelProCam/Captures"
 
-    // Color, 3D LUTs & Cinema 2.35:1 Scope
+    // Color, 3D LUTs, GPU Optical Shaders & Cinema 2.35:1 Scope
     @Published var selectedLUT: String = "sony"
     @Published var lutIntensity: Double = 0.75
+    @Published var proMistEnabled: Bool = true
+    @Published var filmGrainEnabled: Bool = true
     @Published var vignetteEnabled: Bool = true
     @Published var letterboxEnabled: Bool = false
 
-    // Manual Picture Adjustments
-    @Published var brightness: Double = 0.015
-    @Published var contrast: Double = 0.08
-    @Published var saturation: Double = 0.06
-    @Published var vargamma: Double = -0.02
+    // Manual Picture Adjustments (Filmic Black Point default)
+    @Published var brightness: Double = -0.005
+    @Published var contrast: Double = 0.12
+    @Published var saturation: Double = 0.09
+    @Published var vargamma: Double = -0.045
     @Published var hueShift: Double = 0.0
-    @Published var sharpness: Double = 0.06
+    @Published var sharpness: Double = 0.07
 
     // Studio Features & RØDE NT1 5th Gen (Pure DSP + Lip-Sync)
     @Published var activeLightingPreset: String = "day"
@@ -223,6 +227,8 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
 
     @Published var pixelSerial: String = "55141FDCH000EC"
     let singleLutFilterName = "Sony S-Cinetone (3D LUT)"
+    let proMistFilterName = "Black Pro-Mist 1/4 (Halation)"
+    let filmGrainFilterName = "Kodak 35mm Film Grain"
 
     var lutPaths: [String: String] {
         let obsLutDir = "\(NSHomeDirectory())/Library/Application Support/obs-studio/LUTs"
@@ -249,7 +255,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 self.logEntries.removeFirst(self.logEntries.count - 60)
             }
         }
-        FileLogger.shared.log("INIT", "Starting PixelProCam Studio v2.1 (EN/RU + Live Preview + 2D Pad + M1-M3 + Mini Mode)")
+        FileLogger.shared.log("INIT", "Starting Mr. Pixel Camera v2.2 (Black Pro-Mist 1/4 + 35mm Grain + Live Preview + 2D Pad + M1-M3)")
 
         let config = URLSessionConfiguration.default
         urlSession = URLSession(configuration: config, delegate: self, delegateQueue: OperationQueue.main)
@@ -328,6 +334,8 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             lutIntensity: lutIntensity,
             vignetteEnabled: vignetteEnabled,
             letterboxEnabled: letterboxEnabled,
+            proMistEnabled: proMistEnabled,
+            filmGrainEnabled: filmGrainEnabled,
             zoomLevel: zoomLevel,
             panX: panX,
             panY: panY,
@@ -369,6 +377,8 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         applyLUTDebounced()
         setVignette(mem.vignetteEnabled)
         setCinemaLetterbox(mem.letterboxEnabled)
+        if let pm = mem.proMistEnabled { setProMist(pm) }
+        if let fg = mem.filmGrainEnabled { setFilmGrain(fg) }
         applyColorCorrection()
         smoothFrameTo(zoom: mem.zoomLevel, panX: mem.panX, panY: mem.panY)
         lastCaptureMessage = tr("✨ Загружен слот M\(slot)", "✨ Loaded custom slot M\(slot)")
@@ -494,6 +504,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         sendOBSRequest(type: "SetRecordDirectory", data: ["recordDirectory": capturesDir], id: "init_rec_dir")
         sendOBSRequest(type: "StartVirtualCam", data: [:], id: "init_start_vcam")
         sendOBSRequest(type: "GetVideoSettings", data: [:], id: "init_video_settings")
+        sendOBSRequest(type: "GetSourceFilterList", data: ["sourceName": "Pixel 10 Pro"], id: "init_source_filters")
         applyRodeLipSyncImmediate()
     }
 
@@ -578,6 +589,19 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 case 480: self.selectedResolution = "480p"
                 case 360: self.selectedResolution = "360p"
                 default:  self.selectedResolution = "1080p"
+                }
+                self.onStatusChangeForMenuBar?()
+            }
+        } else if reqId == "init_source_filters", let filters = data["filters"] as? [[String: Any]] {
+            DispatchQueue.main.async {
+                for f in filters {
+                    let name = f["filterName"] as? String ?? ""
+                    let enabled = f["filterEnabled"] as? Bool ?? false
+                    if name == self.proMistFilterName {
+                        self.proMistEnabled = enabled
+                    } else if name == self.filmGrainFilterName {
+                        self.filmGrainEnabled = enabled
+                    }
                 }
                 self.onStatusChangeForMenuBar?()
             }
@@ -1162,6 +1186,28 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
     }
 
+    func setProMist(_ enabled: Bool) {
+        proMistEnabled = enabled
+        FileLogger.shared.log("OPTICS", "Black Pro-Mist 1/4 Optical Halation = \(enabled)")
+        sendOBSRequest(type: "SetSourceFilterEnabled", data: [
+            "sourceName": "Pixel 10 Pro",
+            "filterName": proMistFilterName,
+            "filterEnabled": enabled
+        ])
+        onStatusChangeForMenuBar?()
+    }
+
+    func setFilmGrain(_ enabled: Bool) {
+        filmGrainEnabled = enabled
+        FileLogger.shared.log("OPTICS", "Kodak 35mm Organic Film Grain = \(enabled)")
+        sendOBSRequest(type: "SetSourceFilterEnabled", data: [
+            "sourceName": "Pixel 10 Pro",
+            "filterName": filmGrainFilterName,
+            "filterEnabled": enabled
+        ])
+        onStatusChangeForMenuBar?()
+    }
+
     func setVignette(_ enabled: Bool) {
         vignetteEnabled = enabled
         FileLogger.shared.log("OPTICS", "Optical Vignette 35mm f/1.4 = \(enabled)")
@@ -1214,17 +1260,17 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     }
 
     func resetExposureAuto() {
-        brightness = 0.015; contrast = 0.08; vargamma = -0.02
+        brightness = -0.005; contrast = 0.12; vargamma = -0.045
         applyColorCorrection()
     }
 
     func resetWhiteBalanceAuto() {
-        hueShift = 0.0; saturation = 0.06
+        hueShift = 0.0; saturation = 0.09
         applyColorCorrection()
     }
 
     func resetAllImageAuto() {
-        brightness = 0.015; contrast = 0.08; saturation = 0.06; vargamma = -0.02; hueShift = 0.0; sharpness = 0.06
+        brightness = -0.005; contrast = 0.12; saturation = 0.09; vargamma = -0.045; hueShift = 0.0; sharpness = 0.07
         activeLightingPreset = "day"
         applyColorCorrection()
         triggerFaceAutofocus()
@@ -1728,7 +1774,7 @@ struct StudioCard<Content: View>: View {
     }
 }
 
-// MARK: - SwiftUI Pro Cinema Dark Deck v2.1
+// MARK: - SwiftUI Pro Cinema Dark Deck v2.2
 struct StudioPanelView: View {
     @ObservedObject var ctrl: StudioController
 
@@ -1776,7 +1822,7 @@ struct StudioPanelView: View {
                         HStack(spacing: 4) {
                             Text("Mr. Pixel Camera")
                                 .font(.system(size: 14, weight: .bold, design: .rounded))
-                            Text("v2.1")
+                            Text("v2.2")
                                 .font(.system(size: 8.5, weight: .bold, design: .monospaced))
                                 .padding(.horizontal, 4).padding(.vertical, 1)
                                 .background(Color.orange.opacity(0.22)).foregroundColor(.orange).cornerRadius(4)
@@ -2075,7 +2121,9 @@ struct StudioPanelView: View {
                                     .padding(.horizontal, 7).padding(.vertical, 4)
                                     .background(ctrl.isHQMode ? Color.green.opacity(0.25) : Color.white.opacity(0.08))
                                     .foregroundColor(ctrl.isHQMode ? .green : .secondary).cornerRadius(5)
-                            }.buttonStyle(.plain)
+                            }
+                            .buttonStyle(.plain)
+                            .help(ctrl.tr("HQ: OFF = честные 60 FPS • HQ: ON = 30 FPS усиленный HDR", "HQ: OFF = true 60 FPS • HQ: ON = 30 FPS enhanced HDR"))
 
                             Toggle("OLED Blackout", isOn: Binding(
                                 get: { ctrl.isBlackoutEnabled },
@@ -2166,10 +2214,10 @@ struct StudioPanelView: View {
                                     swatch: [Color.white.opacity(0.25), Color.white.opacity(0.45)], accent: .secondary)
                         }
 
-                        HStack(spacing: 10) {
-                            Text(ctrl.tr("Сила LUT: \(Int(ctrl.lutIntensity * 100))%", "LUT Strength: \(Int(ctrl.lutIntensity * 100))%"))
-                                .font(.system(size: 10, weight: .semibold))
-                                .frame(width: 96, alignment: .leading)
+                        HStack(spacing: 8) {
+                            Text(ctrl.tr("LUT: \(Int(ctrl.lutIntensity * 100))%", "LUT: \(Int(ctrl.lutIntensity * 100))%"))
+                                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                                .frame(width: 60, alignment: .leading)
 
                             Slider(value: Binding(
                                 get: { ctrl.lutIntensity },
@@ -2177,19 +2225,35 @@ struct StudioPanelView: View {
                             ), in: 0.0...1.0)
                             .controlSize(.small)
 
-                            Toggle(ctrl.tr("Виньетка 35mm", "35mm Vignette"), isOn: Binding(
+                            Toggle("✨ Pro-Mist", isOn: Binding(
+                                get: { ctrl.proMistEnabled },
+                                set: { ctrl.setProMist($0) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 10, weight: .semibold))
+                            .help(ctrl.tr("GPU-шейдер Black Pro-Mist 1/4: мягкое сияние бликов и тёплая галяция", "Black Pro-Mist 1/4 GPU shader: optical highlight bloom & warm halation"))
+
+                            Toggle("🎞 35mm", isOn: Binding(
+                                get: { ctrl.filmGrainEnabled },
+                                set: { ctrl.setFilmGrain($0) }
+                            ))
+                            .toggleStyle(.checkbox)
+                            .font(.system(size: 10))
+                            .help(ctrl.tr("Органическое зерно киноплёнки Kodak 35mm", "Organic Kodak 35mm motion picture film grain"))
+
+                            Toggle(ctrl.tr("Виньетка", "Vignette"), isOn: Binding(
                                 get: { ctrl.vignetteEnabled },
                                 set: { ctrl.setVignette($0) }
                             ))
                             .toggleStyle(.checkbox)
-                            .font(.system(size: 10.5))
+                            .font(.system(size: 10))
 
-                            Toggle(ctrl.tr("🎬 Рамка 2.35:1", "🎬 2.35:1 Scope"), isOn: Binding(
+                            Toggle("🎬 2.35:1", isOn: Binding(
                                 get: { ctrl.letterboxEnabled },
                                 set: { ctrl.setCinemaLetterbox($0) }
                             ))
                             .toggleStyle(.checkbox)
-                            .font(.system(size: 10.5, weight: .bold))
+                            .font(.system(size: 10, weight: .bold))
                         }
                     }
                 }
@@ -2548,7 +2612,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             defer: false
         )
         window.center()
-        window.title = "Mr. Pixel Camera v2.1 — mrmo.es"
+        window.title = "Mr. Pixel Camera v2.2 — mrmo.es"
         window.backgroundColor = NSColor(calibratedRed: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
         window.isReleasedWhenClosed = false
         window.contentView = NSHostingView(rootView: contentView)
@@ -2581,7 +2645,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     if let rep = view.bitmapImageRepForCachingDisplay(in: bounds) {
                         view.cacheDisplay(in: bounds, to: rep)
                         if let png = rep.representation(using: .png, properties: [:]) {
-                            let out = "\(NSHomeDirectory())/Desktop/PixelProCam/assets/screenshots/studio_ui_v2.1.png"
+                            let out = "\(NSHomeDirectory())/Desktop/PixelProCam/assets/screenshots/studio_ui_v2.2.png"
                             try? png.write(to: URL(fileURLWithPath: out))
                         }
                     }
@@ -2696,6 +2760,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         mirrorItem.target = self
         mirrorItem.state = ctrl.isMirrored ? .on : .off
         menu.addItem(mirrorItem)
+
+        let proMistItem = NSMenuItem(title: ctrl.tr("✨ Black Pro-Mist 1/4 (Галяция)", "✨ Black Pro-Mist 1/4 (Optical Halation)"), action: #selector(menuToggleProMist), keyEquivalent: "")
+        proMistItem.target = self
+        proMistItem.state = ctrl.proMistEnabled ? .on : .off
+        menu.addItem(proMistItem)
+
+        let grainItem = NSMenuItem(title: ctrl.tr("🎞 Кино-зерно Kodak 35mm", "🎞 Kodak 35mm Film Grain"), action: #selector(menuToggleFilmGrain), keyEquivalent: "")
+        grainItem.target = self
+        grainItem.state = ctrl.filmGrainEnabled ? .on : .off
+        menu.addItem(grainItem)
 
         let letterboxItem = NSMenuItem(title: ctrl.tr("🎬 Кино-рамка 2.35:1", "🎬 2.35:1 Cinema Scope"), action: #selector(menuToggleLetterbox), keyEquivalent: "")
         letterboxItem.target = self
@@ -2827,6 +2901,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func menuToggleAi() { ctrl.toggleAiAutoFraming(!ctrl.aiAutoFrameEnabled) }
     @objc func menuAiOnce() { ctrl.triggerSingleAiFaceFrame() }
     @objc func menuToggleMirror() { ctrl.toggleMirror(!ctrl.isMirrored) }
+    @objc func menuToggleProMist() { ctrl.setProMist(!ctrl.proMistEnabled) }
+    @objc func menuToggleFilmGrain() { ctrl.setFilmGrain(!ctrl.filmGrainEnabled) }
     @objc func menuToggleLetterbox() { ctrl.setCinemaLetterbox(!ctrl.letterboxEnabled) }
     @objc func menuSet60Fps() { ctrl.setCameraFpsMode(use60Fps: true) }
     @objc func menuSet30Fps() { ctrl.setCameraFpsMode(use60Fps: false) }

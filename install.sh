@@ -1,17 +1,20 @@
 #!/bin/bash
 set -e
 
-echo "🎬 Installing Mr. Pixel Camera v2.1 for macOS (by mrmo.es)..."
+echo "🎬 Installing Mr. Pixel Camera v2.2 for macOS (by mrmo.es)..."
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS_LUT_DIR="$HOME/Library/Application Support/obs-studio/LUTs"
 APP_BUNDLE="$REPO_DIR/Mr. Pixel Camera.app"
 
-# 1. Install 3D LUTs (.cube) & Optical Overlays (.png) into OBS Studio
+# 1. Install 3D LUTs (.cube), GPU Shaders (.shader) & Optical Overlays (.png) into OBS Studio
 mkdir -p "$OBS_LUT_DIR"
 cp -f "$REPO_DIR/assets/luts/"*.cube "$OBS_LUT_DIR/"
 cp -f "$REPO_DIR/assets/overlays/"*.png "$OBS_LUT_DIR/"
-echo "✅ Installed 33x33x33 3D LUTs & Cinema Overlays into: $OBS_LUT_DIR"
+if [ -d "$REPO_DIR/assets/shaders" ]; then
+    cp -f "$REPO_DIR/assets/shaders/"*.shader "$OBS_LUT_DIR/"
+fi
+echo "✅ Installed 3D LUTs, GPU Cinema Shaders & Overlays into: $OBS_LUT_DIR"
 
 # 2. Build Native macOS App Bundle (Apple Silicon / Intel)
 mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
@@ -36,9 +39,9 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleShortVersionString</key>
-    <string>2.1</string>
+    <string>2.2</string>
     <key>CFBundleVersion</key>
-    <string>21</string>
+    <string>22</string>
     <key>LSMinimumSystemVersion</key>
     <string>13.0</string>
     <key>NSHighResolutionCapable</key>
@@ -56,6 +59,7 @@ if [ -f "$REPO_DIR/bin/adb" ]; then
     cp -f "$REPO_DIR/bin/adb" "$APP_BUNDLE/Contents/MacOS/adb"
     chmod +x "$APP_BUNDLE/Contents/MacOS/adb"
 fi
+codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
 
 touch "$APP_BUNDLE"
 echo "✅ Built native macOS app: $APP_BUNDLE"
@@ -76,5 +80,5 @@ EOF
     echo "✅ Configured OBS WebSocket v5 (port 4455)"
 fi
 
-echo "🚀 Launching PixelProCam Studio.app..."
+echo "🚀 Launching Mr. Pixel Camera.app..."
 open "$APP_BUNDLE"
