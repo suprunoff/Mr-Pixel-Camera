@@ -1273,7 +1273,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         brightness = -0.005; contrast = 0.12; saturation = 0.09; vargamma = -0.045; hueShift = 0.0; sharpness = 0.07
         activeLightingPreset = "day"
         applyColorCorrection()
-        triggerFaceAutofocus()
+        triggerContinuousAutofocus()
     }
 
     // MARK: - 4. Studio Lighting Scenarios
@@ -1528,13 +1528,20 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     }
 
     func triggerFaceAutofocus() {
-        FileLogger.shared.log("ADB", "Triggering Face/Eye Center Lock AF (540, 1100)")
-        runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 540 1100")
+        FileLogger.shared.log("ADB", "Locking Center Touch-AF at viewfinder center (540, 1061)")
+        runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 540 1061")
     }
 
     func triggerContinuousAutofocus() {
-        FileLogger.shared.log("ADB", "Resetting to Continuous Video AF (CAF)")
-        runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 540 320")
+        let returnTap: String
+        switch selectedPhysicalLens {
+        case "0.5x": returnTap = "input tap 414 2149"
+        case "2x":   returnTap = "input tap 666 2149"
+        default:     returnTap = "input tap 540 2149"
+        }
+        let altTap = (selectedPhysicalLens == "2x") ? "input tap 540 2149" : "input tap 666 2149"
+        FileLogger.shared.log("ADB", "Clearing stuck Touch-AF ROI -> restoring Pixel native Continuous Face AF (kFace)")
+        runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && \(altTap) && sleep 0.5 && \(returnTap)")
     }
 
     func toggleHQMode() {
