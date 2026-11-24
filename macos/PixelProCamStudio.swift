@@ -208,6 +208,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     private var colorUpdateWorkItem: DispatchWorkItem?
     private var lutUpdateWorkItem: DispatchWorkItem?
     private var syncUpdateWorkItem: DispatchWorkItem?
+    private var hasCompletedInitialPixelPoll: Bool = false
 
     let adbPath: String = {
         let bundled = Bundle.main.bundlePath + "/Contents/MacOS/adb"
@@ -707,6 +708,11 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 "inputSettings": [
                     "device": "0x10000018d14eee",
                     "device_name": "Pixel 10 Pro",
+                    "use_preset": false,
+                    "input_format": 2,
+                    "color_space": 2,
+                    "video_range": 1,
+                    "enable_audio": false,
                     "buffering": false,
                     "resolution": resJson,
                     "frame_rate": ["denominator": 1000000, "numerator": num]
@@ -904,6 +910,11 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         sendOBSRequest(type: "SetInputSettings", data: [
             "inputName": "Pixel 10 Pro",
             "inputSettings": [
+                "use_preset": false,
+                "input_format": 2,
+                "color_space": 2,
+                "video_range": 1,
+                "enable_audio": false,
                 "buffering": false,
                 "resolution": resJson,
                 "frame_rate": [
@@ -1410,11 +1421,13 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
 
                 DispatchQueue.main.async {
                     let wasDisconnected = !self.pixelConnected
+                    let isHotPlug = self.hasCompletedInitialPixelPoll && connected && wasDisconnected
+                    self.hasCompletedInitialPixelPoll = true
                     if self.pixelConnected != connected {
                         self.pixelConnected = connected
-                        if connected && wasDisconnected {
+                        if isHotPlug {
                             // Auto-recover OBS UVC capture when Pixel 10 Pro is hot-plugged
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
                                 self.reconnectCameraAndVirtualCam()
                             }
                         }
