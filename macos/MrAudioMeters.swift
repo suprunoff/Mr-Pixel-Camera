@@ -6,7 +6,75 @@ import AudioToolbox
 import Accelerate
 import IOKit
 import IOKit.hid
+import Carbon
+import ScreenCaptureKit
+import CoreMedia
 import Foundation
+
+// MARK: - Launch at Login Helper (~/Library/LaunchAgents)
+final class LaunchAgentManager {
+    static let label = "es.mrmo.MrAudioMeters"
+    static var plistURL: URL {
+        URL(fileURLWithPath: "\(NSHomeDirectory())/Library/LaunchAgents/\(label).plist")
+    }
+
+    static var isEnabled: Bool {
+        FileManager.default.fileExists(atPath: plistURL.path)
+    }
+
+    static func setEnabled(_ enabled: Bool) {
+        let fm = FileManager.default
+        if enabled {
+            let dir = plistURL.deletingLastPathComponent()
+            try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+            let appPath = Bundle.main.bundlePath.hasSuffix(".app")
+                ? Bundle.main.bundlePath
+                : "\(NSHomeDirectory())/Desktop/PixelProCam/Mr. Audio Meters.app"
+            let plist: [String: Any] = [
+                "Label": label,
+                "ProgramArguments": ["/usr/bin/open", "-a", appPath],
+                "RunAtLoad": true,
+                "KeepAlive": false
+            ]
+            if let data = try? PropertyListSerialization.data(fromPropertyList: plist, format: .xml, options: 0) {
+                try? data.write(to: plistURL)
+            }
+        } else {
+            try? fm.removeItem(at: plistURL)
+        }
+    }
+}
+
+// MARK: - System-Wide Global Hotkey Manager (⌘⇧M Mute — Works Over Full-Screen Apps!)
+final class GlobalHotkeyManager {
+    static let shared = GlobalHotkeyManager()
+    private var hotKeyRef: EventHotKeyRef?
+    private var handlerRef: EventHandlerRef?
+    var onMuteToggle: (() -> Void)?
+
+    func registerMuteHotkey() {
+        unregister()
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
+        InstallEventHandler(
+            GetApplicationEventTarget(),
+            { _, _, userData -> OSStatus in
+                guard let ud = userData else { return noErr }
+                let mgr = Unmanaged<GlobalHotkeyManager>.fromOpaque(ud).takeUnretainedValue()
+                DispatchQueue.main.async { mgr.onMuteToggle?() }
+                return noErr
+            },
+            1, &eventType, selfPtr, &handlerRef
+        )
+        let hotKeyID = EventHotKeyID(signature: OSType(0x4D52414D), id: 1) // 'MRAM'
+        RegisterEventHotKey(UInt32(kVK_ANSI_M), UInt32(cmdKey | shiftKey), hotKeyID, GetApplicationEventTarget(), 0, &hotKeyRef)
+    }
+
+    func unregister() {
+        if let hk = hotKeyRef { UnregisterEventHotKey(hk); hotKeyRef = nil }
+        if let hr = handlerRef { RemoveEventHandler(hr); handlerRef = nil }
+    }
+}
 
 // MARK: - CoreAudio Input Device Discovery & Hardware Gain
 struct AudioInputDevice: Identifiable, Hashable {
@@ -161,6 +229,244 @@ final class CoreAudioHelper {
     }
 }
 
+// MARK: - OBS WebSocket v5 Bridge (Controls AI RNNoise Filter & Syncs OBS Mic Mute)
+final class OBSWebSocketBridge: NSObject {
+    private var wsTask: URLSessionWebSocketTask?
+    private lazy var session: URLSession = URLSession(configuration: .default)
+    private var reconnectTimer: Timer?
+    private var isIdentified = false
+    private(set) var targetMicName = "RØDE NT1 5th Gen"
+    private let rnnoiseFilterName = "ИИ-Шумоподавление (RNNoise)"
+    private var hasRnnoiseFilter = false
+
+    var onConnectionChanged: ((Bool) -> Void)?
+    var onRnnoiseStateChanged: ((Bool) -> Void)?
+
+    func start() {
+        connect()
+        reconnectTimer?.invalidate()
+        reconnectTimer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in
+            guard let self = self, !self.isIdentified else { return }
+            self.connect()
+        }
+    }
+
+    func stop() {
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        wsTask?.cancel(with: .normalClosure, reason: nil)
+        wsTask = nil
+        isIdentified = false
+    }
+
+    private func connect() {
+        wsTask?.cancel(with: .normalClosure, reason: nil)
+        guard let url = URL(string: "ws://127.0.0.1:4455") else { return }
+        let task = session.webSocketTask(with: url)
+        wsTask = task
+        task.resume()
+        receiveNext()
+    }
+
+    private func receiveNext() {
+        wsTask?.receive { [weak self] result in
+            guard let self = self else { return }
+            switch result {
+            case .success(let msg):
+                if case .string(let txt) = msg, let data = txt.data(using: .utf8),
+                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                    self.handleMessage(json)
+                }
+                self.receiveNext()
+            case .failure:
+                if self.isIdentified {
+                    self.isIdentified = false
+                    DispatchQueue.main.async { self.onConnectionChanged?(false) }
+                }
+            }
+        }
+    }
+
+    private func sendJSON(_ obj: [String: Any]) {
+        guard let data = try? JSONSerialization.data(withJSONObject: obj),
+              let str = String(data: data, encoding: .utf8) else { return }
+        wsTask?.send(.string(str)) { _ in }
+    }
+
+    private func sendReq(_ type: String, data: [String: Any], id: String = UUID().uuidString) {
+        guard isIdentified else { return }
+        sendJSON(["op": 6, "d": ["requestType": type, "requestId": id, "requestData": data]])
+    }
+
+    private func handleMessage(_ json: [String: Any]) {
+        guard let op = json["op"] as? Int else { return }
+        if op == 0 {
+            sendJSON(["op": 1, "d": ["rpcVersion": 1, "eventSubscriptions": 0]])
+        } else if op == 2 {
+            isIdentified = true
+            DispatchQueue.main.async { self.onConnectionChanged?(true) }
+            sendReq("GetInputList", data: [:], id: "discover_inputs")
+        } else if op == 7, let d = json["d"] as? [String: Any], let reqId = d["requestId"] as? String {
+            let respData = d["responseData"] as? [String: Any] ?? [:]
+            if reqId == "discover_inputs", let inputs = respData["inputs"] as? [[String: Any]] {
+                if let rode = inputs.first(where: { ($0["inputName"] as? String)?.localizedCaseInsensitiveContains("RØDE") == true || ($0["inputName"] as? String)?.localizedCaseInsensitiveContains("NT1") == true }),
+                   let name = rode["inputName"] as? String {
+                    targetMicName = name
+                } else if let anyAudio = inputs.first(where: { ($0["inputKind"] as? String)?.contains("coreaudio_input") == true }),
+                          let name = anyAudio["inputName"] as? String {
+                    targetMicName = name
+                }
+                sendReq("GetSourceFilterList", data: ["sourceName": targetMicName], id: "discover_filters")
+            } else if reqId == "discover_filters", let filters = respData["filters"] as? [[String: Any]] {
+                if let rn = filters.first(where: { ($0["filterName"] as? String) == rnnoiseFilterName || ($0["filterKind"] as? String) == "noise_suppress_filter_v2" }) {
+                    hasRnnoiseFilter = true
+                    let en = (rn["filterEnabled"] as? Bool) ?? false
+                    DispatchQueue.main.async { self.onRnnoiseStateChanged?(en) }
+                } else {
+                    hasRnnoiseFilter = false
+                }
+            }
+        }
+    }
+
+    func setRnnoiseEnabled(_ enabled: Bool) {
+        guard isIdentified else { return }
+        if !hasRnnoiseFilter && enabled {
+            sendReq("CreateSourceFilter", data: [
+                "sourceName": targetMicName,
+                "filterName": rnnoiseFilterName,
+                "filterKind": "noise_suppress_filter_v2",
+                "filterSettings": ["method": "rnnoise"]
+            ], id: "create_rnnoise")
+            hasRnnoiseFilter = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) { [weak self] in
+                guard let self = self else { return }
+                self.sendReq("SetSourceFilterEnabled", data: [
+                    "sourceName": self.targetMicName,
+                    "filterName": self.rnnoiseFilterName,
+                    "filterEnabled": enabled
+                ], id: "toggle_rnnoise")
+            }
+        } else {
+            sendReq("SetSourceFilterEnabled", data: [
+                "sourceName": targetMicName,
+                "filterName": rnnoiseFilterName,
+                "filterEnabled": enabled
+            ], id: "toggle_rnnoise")
+        }
+        DispatchQueue.main.async { self.onRnnoiseStateChanged?(enabled) }
+    }
+
+    func setObsMicMuted(_ muted: Bool) {
+        guard isIdentified else { return }
+        sendReq("SetInputMute", data: ["inputName": targetMicName, "inputMuted": muted], id: "obs_mute")
+    }
+}
+
+// MARK: - macOS System Audio Capture (ScreenCaptureKit — Like Original MiniMeters!)
+@available(macOS 13.0, *)
+final class SystemAudioTap: NSObject, SCStreamOutput {
+    private var stream: SCStream?
+    private let sampleQueue = DispatchQueue(label: "es.mrmo.systemaudio.tap", qos: .userInteractive)
+    var onAudioSamples: (([Float], [Float]) -> Void)?
+    var onPermissionError: ((String) -> Void)?
+
+    func start() {
+        stop()
+        SCShareableContent.getExcludingDesktopWindows(false, onScreenWindowsOnly: false) { [weak self] content, error in
+            guard let self = self else { return }
+            if let error = error {
+                DispatchQueue.main.async { self.onPermissionError?(error.localizedDescription) }
+                return
+            }
+            guard let display = content?.displays.first else {
+                DispatchQueue.main.async { self.onPermissionError?("No display found for System Audio") }
+                return
+            }
+            let filter = SCContentFilter(display: display, excludingApplications: [], exceptingWindows: [])
+            let cfg = SCStreamConfiguration()
+            cfg.capturesAudio = true
+            cfg.excludesCurrentProcessAudio = true
+            cfg.sampleRate = 48000
+            cfg.channelCount = 2
+            // Minimal video footprint (audio-only analysis)
+            cfg.width = 4
+            cfg.height = 4
+            cfg.minimumFrameInterval = CMTime(value: 1, timescale: 2)
+
+            let scStream = SCStream(filter: filter, configuration: cfg, delegate: nil)
+            do {
+                try scStream.addStreamOutput(self, type: .audio, sampleHandlerQueue: self.sampleQueue)
+                scStream.startCapture { [weak self] err in
+                    if let err = err {
+                        DispatchQueue.main.async { self?.onPermissionError?(err.localizedDescription) }
+                    }
+                }
+                self.stream = scStream
+            } catch {
+                DispatchQueue.main.async { self.onPermissionError?(error.localizedDescription) }
+            }
+        }
+    }
+
+    func stop() {
+        if let s = stream {
+            s.stopCapture { _ in }
+            stream = nil
+        }
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard type == .audio, sampleBuffer.isValid,
+              let formatDesc = CMSampleBufferGetFormatDescription(sampleBuffer),
+              let asbdPtr = CMAudioFormatDescriptionGetStreamBasicDescription(formatDesc) else { return }
+        let asbd = asbdPtr.pointee
+        let numFrames = Int(CMSampleBufferGetNumSamples(sampleBuffer))
+        guard numFrames > 0 else { return }
+
+        var blockBuffer: CMBlockBuffer?
+        var ablSize = 0
+        CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer, bufferListSizeNeededOut: &ablSize, bufferListOut: nil, bufferListSize: 0,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: 0, blockBufferOut: nil
+        )
+        guard ablSize > 0 else { return }
+        let ablRaw = UnsafeMutableRawPointer.allocate(byteCount: ablSize, alignment: MemoryLayout<AudioBufferList>.alignment)
+        defer { ablRaw.deallocate() }
+        let ablPtr = ablRaw.assumingMemoryBound(to: AudioBufferList.self)
+
+        let status = CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer(
+            sampleBuffer, bufferListSizeNeededOut: nil, bufferListOut: ablPtr, bufferListSize: ablSize,
+            blockBufferAllocator: nil, blockBufferMemoryAllocator: nil, flags: kCMSampleBufferFlag_AudioBufferList_Assure16ByteAlignment,
+            blockBufferOut: &blockBuffer
+        )
+        guard status == noErr else { return }
+        let bufs = UnsafeMutableAudioBufferListPointer(ablPtr)
+        guard let firstBuf = bufs.first, let mData = firstBuf.mData else { return }
+
+        let isFloat = (asbd.mFormatFlags & kAudioFormatFlagIsFloat) != 0
+        guard isFloat else { return }
+
+        let isNonInterleaved = (asbd.mFormatFlags & kAudioFormatFlagIsNonInterleaved) != 0
+        var left = [Float](repeating: 0, count: numFrames)
+        var right = [Float](repeating: 0, count: numFrames)
+
+        if isNonInterleaved {
+            let pL = mData.assumingMemoryBound(to: Float.self)
+            let pR = (bufs.count >= 2 && bufs[1].mData != nil) ? bufs[1].mData!.assumingMemoryBound(to: Float.self) : pL
+            for i in 0..<numFrames { left[i] = pL[i]; right[i] = pR[i] }
+        } else {
+            let ch = max(1, Int(asbd.mChannelsPerFrame))
+            let p = mData.assumingMemoryBound(to: Float.self)
+            for i in 0..<numFrames {
+                left[i] = p[i * ch]
+                right[i] = ch >= 2 ? p[i * ch + 1] : p[i * ch]
+            }
+        }
+        onAudioSamples?(left, right)
+    }
+}
+
 // MARK: - RØDE NT1 5th Gen Hardware DSP State & Native USB HID + CoreAudio Controller
 struct RodeDSPSettings: Codable, Equatable {
     var inputGainDb: Double = 42.0       // 0...60 dB (CoreAudio HAL)
@@ -198,8 +504,7 @@ final class RodeNT1HardwareBridge {
     static let vendorID: Int = 0x19F7
     static let productID: Int = 0x0054 // RØDE NT1 5th Gen
 
-    // Smooth 17-knot DSP fixed-point Q1.31 response curves matching the onboard APHEX DSP engine
-    private static let knotPositions: [Double] = [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255]
+    private static let knotPositions: [Double]   = [0, 16, 32, 48, 64, 80, 96, 112, 128, 144, 160, 176, 192, 208, 224, 240, 255]
     private static let compGainKnots: [Double]   = [0.0, 0.040745, 0.076846, 0.115246, 0.156936, 0.2006, 0.249038, 0.298383, 0.351103, 0.405098, 0.461898, 0.523498, 0.593098, 0.666498, 0.742178, 0.829168, 0.913168]
     private static let compThreshKnots: [Double] = [0.0, 0.007202, 0.015533, 0.025574, 0.037689, 0.052277, 0.069885, 0.091217, 0.117249, 0.149261, 0.189178, 0.239777, 0.305359, 0.393219, 0.516632, 0.70343, 0.999908]
     private static let compAtkKnots: [Double]    = [0.105049, 0.039488, 0.026786, 0.016562, 0.010241, 0.006332, 0.003916, 0.00242, 0.001497, 0.000925, 0.00059, 0.000352, 0.000218, 0.000135, 0.0001, 0.000066, 0.000034]
@@ -232,33 +537,21 @@ final class RodeNT1HardwareBridge {
     private func ensureConnectedOnQueue() -> Bool {
         if device != nil { return true }
         let mgr = IOHIDManagerCreate(kCFAllocatorDefault, IOOptionBits(kIOHIDOptionsTypeNone))
-        let match: [String: Any] = [
-            kIOHIDVendorIDKey: Self.vendorID,
-            kIOHIDProductIDKey: Self.productID
-        ]
-        IOHIDManagerSetDeviceMatching(mgr, match as CFDictionary)
-        guard IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else {
-            return false
-        }
+        IOHIDManagerSetDeviceMatching(mgr, [kIOHIDVendorIDKey: Self.vendorID, kIOHIDProductIDKey: Self.productID] as CFDictionary)
+        guard IOHIDManagerOpen(mgr, IOOptionBits(kIOHIDOptionsTypeNone)) == kIOReturnSuccess else { return false }
         guard let devs = IOHIDManagerCopyDevices(mgr) as? Set<IOHIDDevice>, let hid = devs.first else {
             IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
             return false
         }
         self.manager = mgr
         self.device = hid
-        IOHIDDeviceRegisterInputReportCallback(
-            hid, &inBuf, inBuf.count, Self.hidCallback,
-            Unmanaged.passUnretained(replyState).toOpaque()
-        )
+        IOHIDDeviceRegisterInputReportCallback(hid, &inBuf, inBuf.count, Self.hidCallback, Unmanaged.passUnretained(replyState).toOpaque())
         return true
     }
 
     private func disconnectOnQueue() {
-        if let mgr = manager {
-            IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone))
-        }
-        manager = nil
-        device = nil
+        if let mgr = manager { IOHIDManagerClose(mgr, IOOptionBits(kIOHIDOptionsTypeNone)) }
+        manager = nil; device = nil
     }
 
     private func xferOnQueue(outID: UInt8, inID: UInt8, payload: [UInt8]) -> [UInt8]? {
@@ -271,12 +564,10 @@ final class RodeNT1HardwareBridge {
         replyState.reply = nil
 
         var full = [outID] + payload
-        let res = IOHIDDeviceSetReport(hid, kIOHIDReportTypeOutput, CFIndex(outID), &full, full.count)
-        if res != kIOReturnSuccess {
+        if IOHIDDeviceSetReport(hid, kIOHIDReportTypeOutput, CFIndex(outID), &full, full.count) != kIOReturnSuccess {
             disconnectOnQueue()
             return nil
         }
-
         let deadline = Date().addingTimeInterval(0.35)
         while replyState.reply == nil && Date() < deadline {
             CFRunLoopRunInMode(.defaultMode, 0.004, true)
@@ -343,118 +634,83 @@ final class RodeNT1HardwareBridge {
                 return Self.knotPositions[j] + max(0, min(1, u)) * (Self.knotPositions[j + 1] - Self.knotPositions[j])
             }
         }
-        let firstDist = abs(target - knots[0])
-        let lastDist = abs(target - (knots.last ?? 0))
-        return firstDist < lastDist ? 0.0 : 255.0
+        return abs(target - knots[0]) < abs(target - (knots.last ?? 0)) ? 0.0 : 255.0
     }
 
     private func encodeGateAttackMs(_ ms: Double) -> Int32 {
-        let clampedMs = max(2.0, min(200.0, ms))
-        let theta = 5000.0 / (clampedMs * 48000.0)
+        let theta = 5000.0 / (max(2.0, min(200.0, ms)) * 48000.0)
         let c = cos(theta)
-        let v = (c - 1.0) + sqrt(max(0.0, c * c - 4.0 * c + 3.0))
-        return clampQ31(v)
+        return clampQ31((c - 1.0) + sqrt(max(0.0, c * c - 4.0 * c + 3.0)))
     }
 
     private func decodeGateAttackMs(_ raw: Int32) -> Double {
         let v = max(0.000105, min(0.616, Double(raw) / Double(1 << 31)))
         let u = v + 1.0
         let cosVal = max(-1.0, min(1.0, (3.0 - u * u) / (4.0 - 2.0 * u)))
-        let theta = max(1e-6, acos(cosVal))
-        return max(2.0, min(200.0, 5000.0 / (48000.0 * theta)))
+        return max(2.0, min(200.0, 5000.0 / (48000.0 * max(1e-6, acos(cosVal)))))
     }
 
-    // MARK: - Public Async Hardware API
+    // Direct hardware mute (Gain=0 dB + Gate=0 dB -> true -∞ dB silence across all macOS apps!)
+    func setHardwareMuteSync(_ muted: Bool, restore: RodeDSPSettings) {
+        ioQueue.sync {
+            if let devId = CoreAudioHelper.findRodeNT1DeviceID() {
+                CoreAudioHelper.setInputGainDb(deviceId: devId, db: muted ? 0.0 : restore.inputGainDb)
+            }
+            guard ensureConnectedOnQueue() else { return }
+            if muted {
+                _ = setGranular(1, 0, data: [1])
+                _ = setGranular(1, 1, data: writeI32(Int32.max)) // 0 dB gate threshold = dead mute
+            } else {
+                _ = setGranular(1, 0, data: [restore.gateEnabled ? 1 : 0])
+                let lin = pow(10.0, max(-90.0, min(0.0, restore.gateThresholdDb)) / 20.0)
+                _ = setGranular(1, 1, data: writeI32(clampQ31(lin)))
+            }
+        }
+    }
+
     func readHardwareSettings(completion: @escaping (Bool, RodeDSPSettings?) -> Void) {
         ioQueue.async { [weak self] in
-            guard let self = self else { return }
-            guard self.ensureConnectedOnQueue() else {
-                DispatchQueue.main.async { completion(false, nil) }
-                return
+            guard let self = self, self.ensureConnectedOnQueue() else {
+                DispatchQueue.main.async { completion(false, nil) }; return
             }
-
             var st = RodeDSPSettings()
-            if let devId = CoreAudioHelper.findRodeNT1DeviceID(),
-               let gain = CoreAudioHelper.getInputGainDb(deviceId: devId) {
+            if let devId = CoreAudioHelper.findRodeNT1DeviceID(), let gain = CoreAudioHelper.getInputGainDb(deviceId: devId) {
                 st.inputGainDb = (gain * 2.0).rounded() / 2.0
             }
-
-            // 1. HPF (Report ID 8 -> 7, param 0x01)
-            var hpfReq = [UInt8](repeating: 0, count: 27)
-            hpfReq[0] = 0x01; hpfReq[1] = 0x01
+            var hpfReq = [UInt8](repeating: 0, count: 27); hpfReq[0] = 0x01; hpfReq[1] = 0x01
             if let r = self.xferOnQueue(outID: 8, inID: 7, payload: hpfReq), r.count >= 4, r[2] == 0x41 {
                 st.hpfMode = min(2, Int(r[3]))
             } else {
-                DispatchQueue.main.async { completion(false, nil) }
-                return
+                DispatchQueue.main.async { completion(false, nil) }; return
             }
-
-            // 2. Compressor (type 0)
             if let en = self.getGranular(0, 0) { st.compEnabled = en[0] != 0 }
-            if let th = self.getGranular(0, 1) {
-                let idx = self.invertCurve(self.readI32(th, 0), knots: Self.compThreshKnots)
-                st.compThresholdDb = ((1.0 - idx / 255.0) * 60.0 - 60.0).rounded()
-            }
-            if let sh = self.getGranular(0, 2) {
-                st.compRatio = ((1.5 + (Double(sh[0]) / 255.0) * 3.0) * 10.0).rounded() / 10.0
-            }
-            if let ak = self.getGranular(0, 3) {
-                let idx = self.invertCurve(self.readI32(ak, 0), knots: Self.compAtkKnots, descending: true)
-                let norm = idx / 255.0
-                st.compAttackMs = (0.1 * pow(100.0, norm) * 10.0).rounded() / 10.0
-            }
-            if let rl = self.getGranular(0, 4) {
-                let idx = self.invertCurve(self.readI32(rl, 0), knots: Self.compRelKnots, descending: true)
-                let norm = idx / 255.0
-                st.compReleaseMs = (5.0 * pow(40.0, norm)).rounded()
-            }
-            if let gn = self.getGranular(0, 5) {
-                let idx = self.invertCurve(self.readI32(gn, 0), knots: Self.compGainKnots)
-                st.compGainDb = ((idx / 255.0) * 9.0 * 2.0).rounded() / 2.0
-            }
+            if let th = self.getGranular(0, 1) { st.compThresholdDb = ((1.0 - self.invertCurve(self.readI32(th, 0), knots: Self.compThreshKnots) / 255.0) * 60.0 - 60.0).rounded() }
+            if let sh = self.getGranular(0, 2) { st.compRatio = ((1.5 + (Double(sh[0]) / 255.0) * 3.0) * 10.0).rounded() / 10.0 }
+            if let ak = self.getGranular(0, 3) { st.compAttackMs = (0.1 * pow(100.0, self.invertCurve(self.readI32(ak, 0), knots: Self.compAtkKnots, descending: true) / 255.0) * 10.0).rounded() / 10.0 }
+            if let rl = self.getGranular(0, 4) { st.compReleaseMs = (5.0 * pow(40.0, self.invertCurve(self.readI32(rl, 0), knots: Self.compRelKnots, descending: true) / 255.0)).rounded() }
+            if let gn = self.getGranular(0, 5) { st.compGainDb = ((self.invertCurve(self.readI32(gn, 0), knots: Self.compGainKnots) / 255.0) * 9.0 * 2.0).rounded() / 2.0 }
 
-            // 3. Noise Gate (type 1)
             if let en = self.getGranular(1, 0) { st.gateEnabled = en[0] != 0 }
             if let th = self.getGranular(1, 1) {
                 let lin = Double(self.readI32(th, 0)) / Double(1 << 31)
                 st.gateThresholdDb = lin > 1e-6 ? max(-85.0, min(0.0, (20.0 * log10(lin)).rounded())) : -80.0
             }
-            if let ak = self.getGranular(1, 2) {
-                st.gateAttackMs = self.decodeGateAttackMs(self.readI32(ak, 0)).rounded()
-            }
-            if let hd = self.getGranular(1, 3) {
-                let frac = max(1e-7, Double(self.readI32(hd, 0)) / Double(1 << 31))
-                st.gateHoldMs = max(10.0, min(500.0, (1.0 / (frac * 48.0)).rounded()))
-            }
-            if let rl = self.getGranular(1, 4) {
-                let frac = max(1e-7, Double(self.readI32(rl, 0)) / Double(1 << 31))
-                st.gateReleaseMs = max(20.0, min(1000.0, (1.0 / (frac * 48.0)).rounded()))
-            }
+            if let ak = self.getGranular(1, 2) { st.gateAttackMs = self.decodeGateAttackMs(self.readI32(ak, 0)).rounded() }
+            if let hd = self.getGranular(1, 3) { st.gateHoldMs = max(10.0, min(500.0, (1.0 / (max(1e-7, Double(self.readI32(hd, 0)) / Double(1 << 31)) * 48.0)).rounded())) }
+            if let rl = self.getGranular(1, 4) { st.gateReleaseMs = max(20.0, min(1000.0, (1.0 / (max(1e-7, Double(self.readI32(rl, 0)) / Double(1 << 31)) * 48.0)).rounded())) }
             if let hy = self.getGranular(1, 5) {
                 let lin = Double(self.readI32(hy, 0)) / Double(1 << 31)
                 st.gateHysteresisDb = lin > 1e-6 ? max(-24.0, min(0.0, (20.0 * log10(lin)).rounded())) : -12.0
             }
 
-            // 4. Aural Exciter (type 2)
             if let en = self.getGranular(2, 0) { st.exciterEnabled = en[0] != 0 }
-            if let mx = self.getGranular(2, 1), mx.count >= 5 {
-                st.exciterMixPct = (Double(mx[4]) / 255.0 * 100.0).rounded()
-            }
-            if let tn = self.getGranular(2, 2), tn.count >= 9 {
-                st.exciterTuneHz = (600.0 + Double(tn[8]) / 255.0 * 4400.0).rounded()
-            }
-            if let hm = self.getGranular(2, 3) {
-                st.exciterHarmonics = Int(hm[0])
-            }
+            if let mx = self.getGranular(2, 1), mx.count >= 5 { st.exciterMixPct = (Double(mx[4]) / 255.0 * 100.0).rounded() }
+            if let tn = self.getGranular(2, 2), tn.count >= 9 { st.exciterTuneHz = (600.0 + Double(tn[8]) / 255.0 * 4400.0).rounded() }
+            if let hm = self.getGranular(2, 3) { st.exciterHarmonics = Int(hm[0]) }
 
-            // 5. Big Bottom (type 3)
             if let en = self.getGranular(3, 0) { st.bigBottomEnabled = en[0] != 0 }
-            if let dr = self.getGranular(3, 1), dr.count >= 5 {
-                st.bigBottomDrivePct = (Double(dr[4]) / 255.0 * 100.0).rounded()
-            }
-            if let tn = self.getGranular(3, 2) {
-                st.bigBottomTuneHz = (60.0 + Double(tn[0]) / 255.0 * 240.0).rounded()
-            }
+            if let dr = self.getGranular(3, 1), dr.count >= 5 { st.bigBottomDrivePct = (Double(dr[4]) / 255.0 * 100.0).rounded() }
+            if let tn = self.getGranular(3, 2) { st.bigBottomTuneHz = (60.0 + Double(tn[0]) / 255.0 * 240.0).rounded() }
 
             DispatchQueue.main.async { completion(true, st) }
         }
@@ -464,66 +720,38 @@ final class RodeNT1HardwareBridge {
         ioQueue.async { [weak self] in
             guard let self = self else { return }
             var allOk = true
-
-            // 0. CoreAudio HAL Input Gain
             if previous == nil || abs((previous?.inputGainDb ?? -999) - s.inputGainDb) > 0.2 {
-                if let devId = CoreAudioHelper.findRodeNT1DeviceID() {
-                    _ = CoreAudioHelper.setInputGainDb(deviceId: devId, db: s.inputGainDb)
-                }
+                if let devId = CoreAudioHelper.findRodeNT1DeviceID() { _ = CoreAudioHelper.setInputGainDb(deviceId: devId, db: s.inputGainDb) }
             }
+            guard self.ensureConnectedOnQueue() else { DispatchQueue.main.async { completion(false) }; return }
 
-            guard self.ensureConnectedOnQueue() else {
-                DispatchQueue.main.async { completion(false) }
-                return
-            }
-
-            // 1. HPF
             if previous == nil || previous?.hpfMode != s.hpfMode {
-                var req = [UInt8](repeating: 0, count: 27)
-                req[0] = 0x01; req[1] = 0x00; req[2] = UInt8(max(0, min(2, s.hpfMode)))
-                if let r = self.xferOnQueue(outID: 8, inID: 7, payload: req), r.count >= 3 {
-                    allOk = allOk && (r[2] == 0x41)
-                } else {
-                    allOk = false
-                }
+                var req = [UInt8](repeating: 0, count: 27); req[0] = 0x01; req[1] = 0x00; req[2] = UInt8(max(0, min(2, s.hpfMode)))
+                if let r = self.xferOnQueue(outID: 8, inID: 7, payload: req), r.count >= 3 { allOk = allOk && (r[2] == 0x41) } else { allOk = false }
             }
-
-            // 2. Noise Gate (type 1)
-            if previous == nil || previous?.gateEnabled != s.gateEnabled {
-                allOk = self.setGranular(1, 0, data: [s.gateEnabled ? 1 : 0]) && allOk
-            }
+            if previous == nil || previous?.gateEnabled != s.gateEnabled { allOk = self.setGranular(1, 0, data: [s.gateEnabled ? 1 : 0]) && allOk }
             if previous == nil || abs((previous?.gateThresholdDb ?? -999) - s.gateThresholdDb) > 0.25 {
-                let lin = pow(10.0, max(-90.0, min(0.0, s.gateThresholdDb)) / 20.0)
-                allOk = self.setGranular(1, 1, data: self.writeI32(self.clampQ31(lin))) && allOk
+                allOk = self.setGranular(1, 1, data: self.writeI32(self.clampQ31(pow(10.0, max(-90.0, min(0.0, s.gateThresholdDb)) / 20.0)))) && allOk
             }
             if previous == nil || abs((previous?.gateAttackMs ?? -999) - s.gateAttackMs) > 0.5 {
                 allOk = self.setGranular(1, 2, data: self.writeI32(self.encodeGateAttackMs(s.gateAttackMs))) && allOk
             }
             if previous == nil || abs((previous?.gateHoldMs ?? -999) - s.gateHoldMs) > 1.0 {
-                let v = 1.0 / (max(10.0, min(500.0, s.gateHoldMs)) * 48.0)
-                allOk = self.setGranular(1, 3, data: self.writeI32(self.clampQ31(v))) && allOk
+                allOk = self.setGranular(1, 3, data: self.writeI32(self.clampQ31(1.0 / (max(10.0, min(500.0, s.gateHoldMs)) * 48.0)))) && allOk
             }
             if previous == nil || abs((previous?.gateReleaseMs ?? -999) - s.gateReleaseMs) > 1.0 {
-                let v = 1.0 / (max(20.0, min(1000.0, s.gateReleaseMs)) * 48.0)
-                allOk = self.setGranular(1, 4, data: self.writeI32(self.clampQ31(v))) && allOk
+                allOk = self.setGranular(1, 4, data: self.writeI32(self.clampQ31(1.0 / (max(20.0, min(1000.0, s.gateReleaseMs)) * 48.0)))) && allOk
             }
             if previous == nil || abs((previous?.gateHysteresisDb ?? -999) - s.gateHysteresisDb) > 0.25 {
-                let lin = pow(10.0, max(-24.0, min(0.0, s.gateHysteresisDb)) / 20.0)
-                allOk = self.setGranular(1, 5, data: self.writeI32(self.clampQ31(lin))) && allOk
+                allOk = self.setGranular(1, 5, data: self.writeI32(self.clampQ31(pow(10.0, max(-24.0, min(0.0, s.gateHysteresisDb)) / 20.0)))) && allOk
             }
-
-            // 3. Compressor (type 0)
-            if previous == nil || previous?.compEnabled != s.compEnabled {
-                allOk = self.setGranular(0, 0, data: [s.compEnabled ? 1 : 0]) && allOk
-            }
+            if previous == nil || previous?.compEnabled != s.compEnabled { allOk = self.setGranular(0, 0, data: [s.compEnabled ? 1 : 0]) && allOk }
             if previous == nil || abs((previous?.compThresholdDb ?? -999) - s.compThresholdDb) > 0.25 {
-                let clamped = max(-60.0, min(0.0, s.compThresholdDb))
-                let idx = (1.0 - (clamped + 60.0) / 60.0) * 255.0
+                let idx = (1.0 - (max(-60.0, min(0.0, s.compThresholdDb)) + 60.0) / 60.0) * 255.0
                 allOk = self.setGranular(0, 1, data: self.writeI32(self.interpCurve(idx, knots: Self.compThreshKnots))) && allOk
             }
             if previous == nil || abs((previous?.compRatio ?? -999) - s.compRatio) > 0.04 {
-                let raw = UInt8(max(0, min(255, Int(round((max(1.5, min(4.5, s.compRatio)) - 1.5) / 3.0 * 255.0)))))
-                allOk = self.setGranular(0, 2, data: [raw]) && allOk
+                allOk = self.setGranular(0, 2, data: [UInt8(max(0, min(255, Int(round((max(1.5, min(4.5, s.compRatio)) - 1.5) / 3.0 * 255.0)))))]) && allOk
             }
             if previous == nil || abs((previous?.compAttackMs ?? -999) - s.compAttackMs) > 0.05 {
                 let norm = max(0.0, min(1.0, log10(max(0.1, min(10.0, s.compAttackMs)) / 0.1) / log10(100.0)))
@@ -534,53 +762,37 @@ final class RodeNT1HardwareBridge {
                 allOk = self.setGranular(0, 4, data: self.writeI32(self.interpCurve(norm * 255.0, knots: Self.compRelKnots, logInterp: true))) && allOk
             }
             if previous == nil || abs((previous?.compGainDb ?? -999) - s.compGainDb) > 0.1 {
-                let idx = max(0.0, min(9.0, s.compGainDb)) / 9.0 * 255.0
-                allOk = self.setGranular(0, 5, data: self.writeI32(self.interpCurve(idx, knots: Self.compGainKnots))) && allOk
+                allOk = self.setGranular(0, 5, data: self.writeI32(self.interpCurve(max(0.0, min(9.0, s.compGainDb)) / 9.0 * 255.0, knots: Self.compGainKnots))) && allOk
             }
-
-            // 4. Aural Exciter (type 2)
-            if previous == nil || previous?.exciterEnabled != s.exciterEnabled {
-                allOk = self.setGranular(2, 0, data: [s.exciterEnabled ? 1 : 0]) && allOk
-            }
+            if previous == nil || previous?.exciterEnabled != s.exciterEnabled { allOk = self.setGranular(2, 0, data: [s.exciterEnabled ? 1 : 0]) && allOk }
             if previous == nil || abs((previous?.exciterMixPct ?? -999) - s.exciterMixPct) > 0.5 {
                 let idx = max(0.0, min(100.0, s.exciterMixPct)) / 100.0 * 255.0
-                let rawByte = UInt8(max(0, min(255, Int(round(idx)))))
-                var payload = self.writeI32(self.interpCurve(idx, knots: Self.aeMixKnots))
-                payload.append(rawByte)
-                allOk = self.setGranular(2, 1, data: payload) && allOk
+                var p = self.writeI32(self.interpCurve(idx, knots: Self.aeMixKnots)); p.append(UInt8(max(0, min(255, Int(round(idx))))))
+                allOk = self.setGranular(2, 1, data: p) && allOk
             }
             if previous == nil || abs((previous?.exciterTuneHz ?? -999) - s.exciterTuneHz) > 15.0 {
                 let idx = (max(600.0, min(5000.0, s.exciterTuneHz)) - 600.0) / 4400.0 * 255.0
-                let rawByte = UInt8(max(0, min(255, Int(round(idx)))))
-                var payload = self.writeI32(self.interpCurve(idx, knots: Self.aeTune1Knots))
-                payload.append(contentsOf: self.writeI32(self.interpCurve(idx, knots: Self.aeTune2Knots)))
-                payload.append(rawByte)
-                allOk = self.setGranular(2, 2, data: payload) && allOk
+                var p = self.writeI32(self.interpCurve(idx, knots: Self.aeTune1Knots))
+                p.append(contentsOf: self.writeI32(self.interpCurve(idx, knots: Self.aeTune2Knots)))
+                p.append(UInt8(max(0, min(255, Int(round(idx))))))
+                allOk = self.setGranular(2, 2, data: p) && allOk
             }
-
-            // 5. Big Bottom (type 3)
-            if previous == nil || previous?.bigBottomEnabled != s.bigBottomEnabled {
-                allOk = self.setGranular(3, 0, data: [s.bigBottomEnabled ? 1 : 0]) && allOk
-            }
+            if previous == nil || previous?.bigBottomEnabled != s.bigBottomEnabled { allOk = self.setGranular(3, 0, data: [s.bigBottomEnabled ? 1 : 0]) && allOk }
             if previous == nil || abs((previous?.bigBottomDrivePct ?? -999) - s.bigBottomDrivePct) > 0.5 {
                 let idx = max(0.0, min(100.0, s.bigBottomDrivePct)) / 100.0 * 255.0
-                let rawByte = UInt8(max(0, min(255, Int(round(idx)))))
-                var payload = self.writeI32(self.interpCurve(idx, knots: Self.aeMixKnots))
-                payload.append(rawByte)
-                allOk = self.setGranular(3, 1, data: payload) && allOk
+                var p = self.writeI32(self.interpCurve(idx, knots: Self.aeMixKnots)); p.append(UInt8(max(0, min(255, Int(round(idx))))))
+                allOk = self.setGranular(3, 1, data: p) && allOk
             }
             if previous == nil || abs((previous?.bigBottomTuneHz ?? -999) - s.bigBottomTuneHz) > 1.0 {
                 let idx = (max(60.0, min(300.0, s.bigBottomTuneHz)) - 60.0) / 240.0 * 255.0
-                let rawByte = UInt8(max(0, min(255, Int(round(idx)))))
-                allOk = self.setGranular(3, 2, data: [rawByte]) && allOk
+                allOk = self.setGranular(3, 2, data: [UInt8(max(0, min(255, Int(round(idx)))))]) && allOk
             }
-
             DispatchQueue.main.async { completion(allOk) }
         }
     }
 }
 
-// MARK: - Room Acoustic Profiles & Built-In Presets (Construction, Studio, Echo, Office)
+// MARK: - Room Acoustic Profiles (Now Linked to OBS AI RNNoise!)
 struct RoomAudioProfile: Codable, Identifiable, Equatable {
     var id: String
     var name: String
@@ -589,17 +801,14 @@ struct RoomAudioProfile: Codable, Identifiable, Equatable {
     var subtitle: String
     var loudnessTarget: String
     var measuredFloorDb: Double?
+    var preferObsRnnoise: Bool?
     var dsp: RodeDSPSettings
 
     static let builtInProfiles: [RoomAudioProfile] = [
         RoomAudioProfile(
-            id: "builtin_construction",
-            name: "Стройка за окном",
-            icon: "hammer.fill",
-            isBuiltIn: true,
-            subtitle: "HPF 150Hz • Жёсткий гейт -33 dB • Без суб-баса",
-            loudnessTarget: LoudnessTarget.podcast.rawValue,
-            measuredFloorDb: -39.0,
+            id: "builtin_construction", name: "Стройка за окном", icon: "hammer.fill", isBuiltIn: true,
+            subtitle: "HPF 150Hz • Гейт -33 dB • OBS AI RNNoise ON • Без суб-баса",
+            loudnessTarget: LoudnessTarget.podcast.rawValue, measuredFloorDb: -39.0, preferObsRnnoise: true,
             dsp: RodeDSPSettings(
                 inputGainDb: 39.0, hpfMode: 2,
                 gateEnabled: true, gateThresholdDb: -33.0, gateAttackMs: 15.0, gateHoldMs: 45.0, gateReleaseMs: 150.0, gateHysteresisDb: -7.0,
@@ -609,13 +818,9 @@ struct RoomAudioProfile: Codable, Identifiable, Equatable {
             )
         ),
         RoomAudioProfile(
-            id: "builtin_studio",
-            name: "Тихая студия",
-            icon: "sparkles",
-            isBuiltIn: true,
-            subtitle: "HPF 75Hz • Мягкий гейт -45 dB • Тёплый бархат",
-            loudnessTarget: LoudnessTarget.podcast.rawValue,
-            measuredFloorDb: -54.0,
+            id: "builtin_studio", name: "Тихая студия", icon: "sparkles", isBuiltIn: true,
+            subtitle: "HPF 75Hz • Мягкий гейт -45 dB • OBS RNNoise OFF • Тёплый бархат",
+            loudnessTarget: LoudnessTarget.podcast.rawValue, measuredFloorDb: -54.0, preferObsRnnoise: false,
             dsp: RodeDSPSettings(
                 inputGainDb: 43.0, hpfMode: 1,
                 gateEnabled: true, gateThresholdDb: -45.0, gateAttackMs: 25.0, gateHoldMs: 70.0, gateReleaseMs: 240.0, gateHysteresisDb: -9.0,
@@ -625,13 +830,9 @@ struct RoomAudioProfile: Codable, Identifiable, Equatable {
             )
         ),
         RoomAudioProfile(
-            id: "builtin_echo",
-            name: "Комната с эхом",
-            icon: "house.fill",
-            isBuiltIn: true,
-            subtitle: "HPF 150Hz • Быстрый релиз • Лёгкий компрессор",
-            loudnessTarget: LoudnessTarget.calls.rawValue,
-            measuredFloorDb: -44.0,
+            id: "builtin_echo", name: "Комната с эхом", icon: "house.fill", isBuiltIn: true,
+            subtitle: "HPF 150Hz • Быстрый релиз 135ms • Лёгкий компрессор 1.8:1",
+            loudnessTarget: LoudnessTarget.calls.rawValue, measuredFloorDb: -44.0, preferObsRnnoise: false,
             dsp: RodeDSPSettings(
                 inputGainDb: 40.0, hpfMode: 2,
                 gateEnabled: true, gateThresholdDb: -36.0, gateAttackMs: 20.0, gateHoldMs: 40.0, gateReleaseMs: 135.0, gateHysteresisDb: -8.0,
@@ -641,13 +842,9 @@ struct RoomAudioProfile: Codable, Identifiable, Equatable {
             )
         ),
         RoomAudioProfile(
-            id: "builtin_office",
-            name: "Офис / Шум",
-            icon: "wind",
-            isBuiltIn: true,
-            subtitle: "HPF 150Hz • Гейт -37 dB • Режет кондиционер",
-            loudnessTarget: LoudnessTarget.calls.rawValue,
-            measuredFloorDb: -43.0,
+            id: "builtin_office", name: "Офис / Шум", icon: "wind", isBuiltIn: true,
+            subtitle: "HPF 150Hz • Гейт -37 dB • OBS RNNoise ON • Режет кондиционер",
+            loudnessTarget: LoudnessTarget.calls.rawValue, measuredFloorDb: -43.0, preferObsRnnoise: true,
             dsp: RodeDSPSettings(
                 inputGainDb: 41.0, hpfMode: 2,
                 gateEnabled: true, gateThresholdDb: -37.0, gateAttackMs: 20.0, gateHoldMs: 55.0, gateReleaseMs: 180.0, gateHysteresisDb: -9.0,
@@ -659,7 +856,7 @@ struct RoomAudioProfile: Codable, Identifiable, Equatable {
     ]
 }
 
-// MARK: - Mic / Vocal Character Presets for RØDE NT1 5th Gen (Composes with Room Presets!)
+// MARK: - Mic / Vocal Character Presets for RØDE NT1 5th Gen
 struct MicVoicePreset: Codable, Identifiable, Equatable {
     var id: String
     var name: String
@@ -678,65 +875,46 @@ struct MicVoicePreset: Codable, Identifiable, Equatable {
     var exciterEnabled: Bool
     var exciterMixPct: Double
     var exciterTuneHz: Double
-    // Optional full snapshot for custom user mic presets
     var fullDspOverride: RodeDSPSettings? = nil
 
     static let builtInPresets: [MicVoicePreset] = [
         MicVoicePreset(
-            id: "mic_radio",
-            name: "Радио / Диктор",
-            icon: "radio.fill",
-            isBuiltIn: true,
+            id: "mic_radio", name: "Радио / Диктор", icon: "radio.fill", isBuiltIn: true,
             subtitle: "Плотный бархат • Comp 2.8:1 (+3.5 dB) • Big Bottom 72% • Exciter 65%",
             compEnabled: true, compThresholdDb: -26.0, compRatio: 2.8, compAttackMs: 0.6, compReleaseMs: 20.0, compGainDb: 3.5,
             bigBottomEnabled: true, bigBottomDrivePct: 72.0, bigBottomTuneHz: 85.0,
             exciterEnabled: true, exciterMixPct: 65.0, exciterTuneHz: 3500.0
         ),
         MicVoicePreset(
-            id: "mic_podcast",
-            name: "Подкаст",
-            icon: "mic.fill",
-            isBuiltIn: true,
+            id: "mic_podcast", name: "Подкаст", icon: "mic.fill", isBuiltIn: true,
             subtitle: "Сбалансированный студийный • Comp 2.1:1 (+2.0 dB) • Big Bottom 52% • Exciter 58%",
             compEnabled: true, compThresholdDb: -24.0, compRatio: 2.1, compAttackMs: 0.8, compReleaseMs: 25.0, compGainDb: 2.0,
             bigBottomEnabled: true, bigBottomDrivePct: 52.0, bigBottomTuneHz: 90.0,
             exciterEnabled: true, exciterMixPct: 58.0, exciterTuneHz: 3500.0
         ),
         MicVoicePreset(
-            id: "mic_calls",
-            name: "Созвоны / Meet",
-            icon: "video.fill",
-            isBuiltIn: true,
+            id: "mic_calls", name: "Созвоны / Meet", icon: "video.fill", isBuiltIn: true,
             subtitle: "Чёткая разборчивость речи • Comp 2.3:1 • Сдержанный бас 25% • Exciter 62%",
             compEnabled: true, compThresholdDb: -22.0, compRatio: 2.3, compAttackMs: 0.7, compReleaseMs: 22.0, compGainDb: 2.0,
             bigBottomEnabled: true, bigBottomDrivePct: 25.0, bigBottomTuneHz: 105.0,
             exciterEnabled: true, exciterMixPct: 62.0, exciterTuneHz: 3100.0
         ),
         MicVoicePreset(
-            id: "mic_bright",
-            name: "Яркий голос",
-            icon: "sun.max.fill",
-            isBuiltIn: true,
+            id: "mic_bright", name: "Яркий голос", icon: "sun.max.fill", isBuiltIn: true,
             subtitle: "Воздух и чёткость дикции • Comp 2.2:1 (+2.5 dB) • Exciter 78% @ 4.0 kHz",
             compEnabled: true, compThresholdDb: -23.0, compRatio: 2.2, compAttackMs: 0.7, compReleaseMs: 24.0, compGainDb: 2.5,
             bigBottomEnabled: true, bigBottomDrivePct: 35.0, bigBottomTuneHz: 95.0,
             exciterEnabled: true, exciterMixPct: 78.0, exciterTuneHz: 4000.0
         ),
         MicVoicePreset(
-            id: "mic_asmr",
-            name: "Мягкий / ASMR",
-            icon: "ear.fill",
-            isBuiltIn: true,
+            id: "mic_asmr", name: "Мягкий / ASMR", icon: "ear.fill", isBuiltIn: true,
             subtitle: "Интимная подача и шёпот • Мягкий Comp 1.7:1 (+3.0 dB) • Exciter 70% @ 4.2 kHz",
             compEnabled: true, compThresholdDb: -28.0, compRatio: 1.7, compAttackMs: 1.5, compReleaseMs: 40.0, compGainDb: 3.0,
             bigBottomEnabled: true, bigBottomDrivePct: 45.0, bigBottomTuneHz: 80.0,
             exciterEnabled: true, exciterMixPct: 70.0, exciterTuneHz: 4200.0
         ),
         MicVoicePreset(
-            id: "mic_raw",
-            name: "Чистый / Raw",
-            icon: "waveform",
-            isBuiltIn: true,
+            id: "mic_raw", name: "Чистый / Raw", icon: "waveform", isBuiltIn: true,
             subtitle: "Без окраса APHEX (Comp / Big Bottom / Exciter OFF) — для вокала и DAW",
             compEnabled: false, compThresholdDb: -24.0, compRatio: 2.0, compAttackMs: 0.8, compReleaseMs: 25.0, compGainDb: 0.0,
             bigBottomEnabled: false, bigBottomDrivePct: 0.0, bigBottomTuneHz: 90.0,
@@ -745,35 +923,27 @@ struct MicVoicePreset: Codable, Identifiable, Equatable {
     ]
 }
 
-// MARK: - ITU-R BS.1770-4 K-Weighting Biquads (@ 48 kHz)
+// MARK: - Biquads, Themes, Targets, Source Mode
 struct BiquadFilter {
     var b0: Float; var b1: Float; var b2: Float
     var a1: Float; var a2: Float
     var z1: Float = 0; var z2: Float = 0
-
     mutating func process(_ x: Float) -> Float {
-        let y = b0 * x + z1
-        z1 = b1 * x - a1 * y + z2
-        z2 = b2 * x - a2 * y
-        return y
+        let y = b0 * x + z1; z1 = b1 * x - a1 * y + z2; z2 = b2 * x - a2 * y; return y
     }
-
     static func kWeightShelf48k() -> BiquadFilter {
-        BiquadFilter(b0: 1.53512485958697, b1: -2.69169618940638, b2: 1.19839281085285,
-                     a1: -1.69065929318241, a2: 0.73248077421585)
+        BiquadFilter(b0: 1.53512485958697, b1: -2.69169618940638, b2: 1.19839281085285, a1: -1.69065929318241, a2: 0.73248077421585)
     }
     static func kWeightHighPass48k() -> BiquadFilter {
-        BiquadFilter(b0: 1.0, b1: -2.0, b2: 1.0,
-                     a1: -1.99004745483398, a2: 0.99007225036621)
+        BiquadFilter(b0: 1.0, b1: -2.0, b2: 1.0, a1: -1.99004745483398, a2: 0.99007225036621)
     }
 }
 
-// MARK: - Iconic Competitor Visual Themes
 enum MeterTheme: String, CaseIterable {
-    case miniCyber   = "MiniMeters"
-    case fabProQ     = "FabFilter"
-    case magmaHeat   = "Magma"
-    case prismCool   = "TDR Prism"
+    case miniCyber = "MiniMeters"
+    case fabProQ   = "FabFilter"
+    case magmaHeat = "Magma"
+    case prismCool = "TDR Prism"
 
     var primary: Color {
         switch self {
@@ -783,7 +953,6 @@ enum MeterTheme: String, CaseIterable {
         case .prismCool: return Color(red: 0.34, green: 0.94, blue: 0.68)
         }
     }
-
     var secondary: Color {
         switch self {
         case .miniCyber: return Color(red: 0.68, green: 0.42, blue: 1.00)
@@ -792,7 +961,6 @@ enum MeterTheme: String, CaseIterable {
         case .prismCool: return Color(red: 0.22, green: 0.68, blue: 1.00)
         }
     }
-
     var bgDark: Color {
         switch self {
         case .miniCyber: return Color(red: 0.045, green: 0.050, blue: 0.068)
@@ -801,81 +969,53 @@ enum MeterTheme: String, CaseIterable {
         case .prismCool: return Color(red: 0.040, green: 0.058, blue: 0.064)
         }
     }
-
     func heatColor(_ v: Float) -> Color {
         let t = Double(max(0, min(1, v)))
         switch self {
         case .miniCyber:
             if t < 0.22 { return Color(red: 0.04, green: 0.06, blue: 0.16 + t * 2.1) }
             if t < 0.55 { let u = (t - 0.22) / 0.33; return Color(red: 0.16 * u, green: 0.24 + u * 0.62, blue: 0.65 + u * 0.35) }
-            let u = (t - 0.55) / 0.45
-            return Color(red: 0.16 + u * 0.84, green: 0.86 + u * 0.14, blue: 1.0)
+            let u = (t - 0.55) / 0.45; return Color(red: 0.16 + u * 0.84, green: 0.86 + u * 0.14, blue: 1.0)
         case .fabProQ:
             if t < 0.30 { return Color(red: 0.12 + t * 1.4, green: 0.07 + t * 0.5, blue: 0.04) }
             if t < 0.70 { let u = (t - 0.30) / 0.40; return Color(red: 0.54 + u * 0.46, green: 0.22 + u * 0.52, blue: 0.05 + u * 0.08) }
-            let u = (t - 0.70) / 0.30
-            return Color(red: 1.0, green: 0.74 + u * 0.26, blue: 0.13 + u * 0.75)
+            let u = (t - 0.70) / 0.30; return Color(red: 1.0, green: 0.74 + u * 0.26, blue: 0.13 + u * 0.75)
         case .magmaHeat:
             if t < 0.25 { let u = t / 0.25; return Color(red: 0.08 + u * 0.35, green: 0.03 + u * 0.05, blue: 0.18 + u * 0.38) }
             if t < 0.65 { let u = (t - 0.25) / 0.40; return Color(red: 0.43 + u * 0.57, green: 0.08 + u * 0.28, blue: 0.56 - u * 0.34) }
-            let u = (t - 0.65) / 0.35
-            return Color(red: 1.0, green: 0.36 + u * 0.62, blue: 0.22 + u * 0.55)
+            let u = (t - 0.65) / 0.35; return Color(red: 1.0, green: 0.36 + u * 0.62, blue: 0.22 + u * 0.55)
         case .prismCool:
             if t < 0.30 { return Color(red: 0.03, green: 0.10 + t * 1.2, blue: 0.16 + t * 1.4) }
             if t < 0.70 { let u = (t - 0.30) / 0.40; return Color(red: 0.05 + u * 0.28, green: 0.46 + u * 0.48, blue: 0.58 + u * 0.22) }
-            let u = (t - 0.70) / 0.30
-            return Color(red: 0.33 + u * 0.65, green: 0.94 + u * 0.06, blue: 0.80 + u * 0.20)
+            let u = (t - 0.70) / 0.30; return Color(red: 0.33 + u * 0.65, green: 0.94 + u * 0.06, blue: 0.80 + u * 0.20)
         }
     }
 }
 
-// MARK: - Youlean-Style Loudness Target Presets
 enum LoudnessTarget: String, CaseIterable {
     case youtube   = "YouTube (-14)"
     case podcast   = "Podcast (-16)"
     case calls     = "Meet/Zoom (-18)"
     case broadcast = "EBU R128 (-23)"
-
     var lufs: Float {
-        switch self {
-        case .youtube:   return -14.0
-        case .podcast:   return -16.0
-        case .calls:     return -18.0
-        case .broadcast: return -23.0
-        }
+        switch self { case .youtube: return -14; case .podcast: return -16; case .calls: return -18; case .broadcast: return -23 }
     }
     var shortLabel: String {
-        switch self {
-        case .youtube:   return "YT -14"
-        case .podcast:   return "POD -16"
-        case .calls:     return "CALL -18"
-        case .broadcast: return "EBU -23"
-        }
+        switch self { case .youtube: return "YT -14"; case .podcast: return "POD -16"; case .calls: return "CALL -18"; case .broadcast: return "EBU -23" }
     }
 }
 
-enum MeterLayoutMode: String, CaseIterable {
-    case bar  = "Bar"
-    case quad = "Quad"
-}
+enum MeterLayoutMode: String, CaseIterable { case bar = "Bar", quad = "Quad" }
+enum AudioSourceMode: String, CaseIterable { case microphone = "Mic", systemAudio = "System" }
 
 struct ColoredWaveSlice {
-    var amplitude: Float
-    var lowWeight: Float
-    var midWeight: Float
-    var highWeight: Float
-
+    var amplitude: Float; var lowWeight: Float; var midWeight: Float; var highWeight: Float
     var color: Color {
         let total = max(0.001, lowWeight + midWeight + highWeight)
-        let l = pow(Double(lowWeight / total), 0.75)
-        let m = pow(Double(midWeight / total), 0.75)
-        let h = pow(Double(highWeight / total), 0.75)
+        let l = pow(Double(lowWeight / total), 0.75); let m = pow(Double(midWeight / total), 0.75); let h = pow(Double(highWeight / total), 0.75)
         let norm = max(0.001, l + m + h)
         let ln = l / norm; let mn = m / norm; let hn = h / norm
-        let r = min(1.0, ln * 1.00 + mn * 0.08 + hn * 0.85)
-        let g = min(1.0, ln * 0.28 + mn * 0.92 + hn * 0.42)
-        let b = min(1.0, ln * 0.22 + mn * 1.00 + hn * 1.00)
-        return Color(red: r, green: g, blue: b)
+        return Color(red: min(1.0, ln * 1.00 + mn * 0.08 + hn * 0.85), green: min(1.0, ln * 0.28 + mn * 0.92 + hn * 0.42), blue: min(1.0, ln * 0.22 + mn * 1.00 + hn * 1.00))
     }
 }
 
@@ -901,6 +1041,8 @@ struct AudioMetersConfig: Codable {
     var customProfiles: [RoomAudioProfile]
     var activeMicPresetId: String?
     var customMicPresets: [MicVoicePreset]?
+    var slotADsp: RodeDSPSettings?
+    var slotBDsp: RodeDSPSettings?
     var windowOpacity: Double
     var lang: String
     var windowX: Double?
@@ -909,7 +1051,7 @@ struct AudioMetersConfig: Codable {
     var windowH: Double?
 }
 
-// MARK: - Acoustic Scan & Calibration Report
+// MARK: - Acoustic Scan / Clap RT60 Report
 struct AcousticScanReport {
     let modeTitle: String
     let environmentLabel: String
@@ -917,21 +1059,24 @@ struct AcousticScanReport {
     let noiseFloorDb: Double
     let peakImpulseDb: Double
     let rumbleDb: Double
+    let rt60Seconds: Double?
     let speechLufs: Double?
     let peakSpeechDb: Double?
     let suggestedDsp: RodeDSPSettings
+    let suggestedRnnoise: Bool
     let appliedToHardware: Bool
 }
 
-// MARK: - Titled Floating Studio Panel (Standard macOS Titlebar + Optional Full-Screen Overlay)
+// MARK: - Titled Floating Studio Panel
 final class FloatingMetersPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { true }
 }
 
-// MARK: - Flagship Audio Analyzer + Noise-Adaptive Room Engine + Live RØDE NT1 Bridge
-final class AudioAnalyzerEngine: ObservableObject {
-    // Device & Runtime
+// MARK: - Flagship Engine v2.5 (Mic + System Audio + RØDE HID + OBS RNNoise + Voice Check + A/B + RT60 + Global Mute)
+final class AudioAnalyzerEngine: NSObject, ObservableObject, AVAudioPlayerDelegate {
+    // Source & Runtime
+    @Published var sourceMode: AudioSourceMode = .microphone
     @Published var devices: [AudioInputDevice] = []
     @Published var selectedDeviceUID: String = ""
     @Published var activeDeviceName: String = "RØDE NT1 5th Gen"
@@ -939,6 +1084,7 @@ final class AudioAnalyzerEngine: ObservableObject {
     @Published var activeChannels: Int = 1
     @Published var isRunning: Bool = false
     @Published var permissionDenied: Bool = false
+    @Published var systemAudioPermissionError: String = ""
     @Published var toastMessage: String = ""
 
     // Visual & Layout Controls
@@ -963,13 +1109,23 @@ final class AudioAnalyzerEngine: ObservableObject {
         return pref.lowercased().hasPrefix("ru") ? "ru" : "en"
     }()
 
-    // Live RØDE NT1 5th Gen Hardware State
+    // Live RØDE NT1 5th Gen Hardware State + A/B Slots + Global Mute
     @Published var rodeConnected: Bool = false
     @Published var rodeSyncing: Bool = false
     @Published var rodeDsp: RodeDSPSettings = RodeDSPSettings()
     @Published var previousRodeDsp: RodeDSPSettings? = nil
+    @Published var activeABSlot: String = "A"
+    @Published var slotADsp: RodeDSPSettings = RodeDSPSettings()
+    @Published var slotBDsp: RodeDSPSettings = RoomAudioProfile.builtInProfiles[1].dsp
+    @Published var isGlobalMuted: Bool = false
+    @Published var isGateOpen: Bool = false
+    @Published var gateNearBreakthrough: Bool = false
 
-    // Multi-Room Profiles & Adaptive Noise Guard
+    // OBS Studio WebSocket Bridge (AI RNNoise Turbo Mode!)
+    @Published var obsConnected: Bool = false
+    @Published var obsRnnoiseEnabled: Bool = false
+
+    // Multi-Room Profiles & Mic Voice Presets & Adaptive Guard
     @Published var customProfiles: [RoomAudioProfile] = []
     @Published var activeProfileId: String = ""
     @Published var autoAdaptiveGuard: Bool = false
@@ -978,7 +1134,6 @@ final class AudioAnalyzerEngine: ObservableObject {
     @Published var showSaveRoomPopover: Bool = false
     @Published var newRoomName: String = ""
 
-    // Mic / Vocal Character Presets (RØDE APHEX Voice Presets)
     @Published var customMicPresets: [MicVoicePreset] = []
     @Published var activeMicPresetId: String = ""
     @Published var showSaveMicPresetPopover: Bool = false
@@ -986,6 +1141,10 @@ final class AudioAnalyzerEngine: ObservableObject {
 
     var allProfiles: [RoomAudioProfile] { RoomAudioProfile.builtInProfiles + customProfiles }
     var allMicPresets: [MicVoicePreset] { MicVoicePreset.builtInPresets + customMicPresets }
+
+    // Instant 5s Voice Check (Record -> Auto Playback into Headphones!)
+    @Published var voiceCheckPhase: String = "" // "", "recording", "playing"
+    @Published var voiceCheckCountdown: Int = 0
 
     // Real-Time Meter Buffers (60 Hz)
     static let spectrumBins = 64
@@ -1019,23 +1178,39 @@ final class AudioAnalyzerEngine: ObservableObject {
     @Published var dominantNote: String = "—"
     @Published var isClipping: Bool = false
 
-    // Acoustic Scan / Calibration State
+    // Acoustic Scan / Calibration / Clap RT60 Echo Test State
     @Published var isScanning: Bool = false
-    @Published var scanMode: String = "" // "noise5s" or "full10s"
+    @Published var scanMode: String = "" // "noise5s", "full10s", "clapEcho"
     @Published var scanCountdown: Int = 0
-    @Published var scanPhase: String = "" // "quiet" or "speak"
+    @Published var scanPhase: String = "" // "quiet", "speak", "waitClap", "captureTail"
     @Published var scanReport: AcousticScanReport? = nil
     @Published var showScanPopover: Bool = false
 
     var onAlwaysOnTopChanged: ((Bool) -> Void)?
     var onOpacityChanged: ((Double) -> Void)?
     var onLayoutChanged: ((MeterLayoutMode, Bool) -> Void)?
+    var onMuteStateChanged: ((Bool) -> Void)?
     var savedWindowFrame: NSRect? = nil
 
-    // Hardware Bridge & Debounce
+    // Hardware Bridges
     private let rodeBridge = RodeNT1HardwareBridge()
+    private let obsBridge = OBSWebSocketBridge()
+    private var sysAudioTap: SystemAudioTap?
     private var lastWrittenRodeDsp: RodeDSPSettings? = nil
+    private var preMuteRodeDsp: RodeDSPSettings? = nil
     private var rodeWriteWorkItem: DispatchWorkItem?
+
+    // Voice Check Player & Recorder
+    private var voiceCheckTimer: Timer?
+    private var voiceCheckSamples: [Float] = []
+    private var isRecordingVoiceCheck: Bool = false
+    private var voicePlayer: AVAudioPlayer?
+
+    // Clap RT60 Echo Test Buffer
+    private var isWaitingForClap: Bool = false
+    private var isCapturingClapTail: Bool = false
+    private var clapTailSamples: [Float] = []
+    private let clapTailTargetSamples = 48000 + 24000 // 1.5s @ 48kHz
 
     // Audio Engine & DSP Internals
     private var audioEngine: AVAudioEngine?
@@ -1070,8 +1245,9 @@ final class AudioAnalyzerEngine: ObservableObject {
     private var clipHoldTimer: Int = 0
     private var noiseFloorEstimate: Float = -54.0
     private var rumbleEstimate: Float = -68.0
+    private var gateHoldFrames: Int = 0
 
-    // Live Adaptive Noise Guard tracking
+    // Adaptive Guard
     private var guardQuietSamples: [Float] = []
     private var guardRumbleSamples: [Float] = []
     private var guardTick: Int = 0
@@ -1113,7 +1289,8 @@ final class AudioAnalyzerEngine: ObservableObject {
     private let cfgKey = "mraudiometers_pro_config_v3"
     func tr(_ ru: String, _ en: String) -> String { lang == "ru" ? ru : en }
 
-    init() {
+    override init() {
+        super.init()
         ringL = Array(repeating: 0, count: fftSize * 2)
         ringR = Array(repeating: 0, count: fftSize * 2)
         clipRing = Array(repeating: 0, count: clipBufferCapacity)
@@ -1125,10 +1302,16 @@ final class AudioAnalyzerEngine: ObservableObject {
         refreshDevices()
         rebuildBinTables(sampleRate: activeSampleRate)
 
+        obsBridge.onConnectionChanged = { [weak self] ok in self?.obsConnected = ok }
+        obsBridge.onRnnoiseStateChanged = { [weak self] en in self?.obsRnnoiseEnabled = en }
+
         let isShot = CommandLine.arguments.contains("--screenshot") || CommandLine.arguments.contains("--screenshot-quad")
         if !isShot {
+            obsBridge.start()
             requestMicAndStart()
             syncFromRodeHardware(silent: true)
+            GlobalHotkeyManager.shared.onMuteToggle = { [weak self] in self?.toggleGlobalMute() }
+            GlobalHotkeyManager.shared.registerMuteHotkey()
         } else {
             layoutMode = CommandLine.arguments.contains("--screenshot") ? .bar : .quad
             showRodeDrawer = !CommandLine.arguments.contains("--screenshot")
@@ -1137,8 +1320,21 @@ final class AudioAnalyzerEngine: ObservableObject {
     }
 
     deinit {
+        if isGlobalMuted, let restore = preMuteRodeDsp {
+            rodeBridge.setHardwareMuteSync(false, restore: restore)
+        }
+        GlobalHotkeyManager.shared.unregister()
+        obsBridge.stop()
         stopEngine()
         if let s = fftSetup { vDSP_destroy_fftsetup(s) }
+    }
+
+    func ensureUnmutedOnExit() {
+        if isGlobalMuted, let restore = preMuteRodeDsp {
+            rodeBridge.setHardwareMuteSync(false, restore: restore)
+            obsBridge.setObsMicMuted(false)
+            isGlobalMuted = false
+        }
     }
 
     // MARK: - Persistence
@@ -1165,6 +1361,8 @@ final class AudioAnalyzerEngine: ObservableObject {
         customProfiles = c.customProfiles
         activeMicPresetId = c.activeMicPresetId ?? ""
         customMicPresets = c.customMicPresets ?? []
+        if let a = c.slotADsp { slotADsp = a }
+        if let b = c.slotBDsp { slotBDsp = b }
         windowOpacity = max(0.65, min(1.0, c.windowOpacity))
         lang = c.lang
         if let x = c.windowX, let y = c.windowY, let w = c.windowW, let h = c.windowH {
@@ -1183,39 +1381,56 @@ final class AudioAnalyzerEngine: ObservableObject {
     func saveConfigNow() {
         guard !CommandLine.arguments.contains("--screenshot") && !CommandLine.arguments.contains("--screenshot-quad") else { return }
         let c = AudioMetersConfig(
-            selectedDeviceUID: selectedDeviceUID,
-            theme: theme.rawValue,
-            layoutMode: layoutMode.rawValue,
-            loudnessTarget: loudnessTarget.rawValue,
-            spectrumTilt: spectrumTilt,
-            alwaysOnTop: alwaysOnTop,
-            showWaveform: showWaveform,
-            showOscilloscope: showOscilloscope,
-            showSpectrum: showSpectrum,
-            showSpectrogram: showSpectrogram,
-            showLoudness: showLoudness,
-            showStereo: showStereo,
-            showTargetCurve: showTargetCurve,
-            showVocalZones: showVocalZones,
-            showRodeDrawer: showRodeDrawer,
-            autoAdaptiveGuard: autoAdaptiveGuard,
-            activeProfileId: activeProfileId,
-            customProfiles: customProfiles,
-            activeMicPresetId: activeMicPresetId,
-            customMicPresets: customMicPresets,
-            windowOpacity: windowOpacity,
-            lang: lang,
-            windowX: savedWindowFrame.map { Double($0.origin.x) },
-            windowY: savedWindowFrame.map { Double($0.origin.y) },
-            windowW: savedWindowFrame.map { Double($0.size.width) },
-            windowH: savedWindowFrame.map { Double($0.size.height) }
+            selectedDeviceUID: selectedDeviceUID, theme: theme.rawValue, layoutMode: layoutMode.rawValue,
+            loudnessTarget: loudnessTarget.rawValue, spectrumTilt: spectrumTilt, alwaysOnTop: alwaysOnTop,
+            showWaveform: showWaveform, showOscilloscope: showOscilloscope, showSpectrum: showSpectrum,
+            showSpectrogram: showSpectrogram, showLoudness: showLoudness, showStereo: showStereo,
+            showTargetCurve: showTargetCurve, showVocalZones: showVocalZones, showRodeDrawer: showRodeDrawer,
+            autoAdaptiveGuard: autoAdaptiveGuard, activeProfileId: activeProfileId, customProfiles: customProfiles,
+            activeMicPresetId: activeMicPresetId, customMicPresets: customMicPresets,
+            slotADsp: slotADsp, slotBDsp: slotBDsp, windowOpacity: windowOpacity, lang: lang,
+            windowX: savedWindowFrame.map { Double($0.origin.x) }, windowY: savedWindowFrame.map { Double($0.origin.y) },
+            windowW: savedWindowFrame.map { Double($0.size.width) }, windowH: savedWindowFrame.map { Double($0.size.height) }
         )
-        if let data = try? JSONEncoder().encode(c) {
-            UserDefaults.standard.set(data, forKey: cfgKey)
+        if let data = try? JSONEncoder().encode(c) { UserDefaults.standard.set(data, forKey: cfgKey) }
+    }
+
+    // MARK: - Global Hardware Mute (⌘⇧M — RØDE NT1 Hardware + OBS Sync!)
+    func toggleGlobalMute() {
+        if !isGlobalMuted {
+            preMuteRodeDsp = rodeDsp
+            isGlobalMuted = true
+            DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                guard let self = self, let restore = self.preMuteRodeDsp else { return }
+                self.rodeBridge.setHardwareMuteSync(true, restore: restore)
+            }
+            obsBridge.setObsMicMuted(true)
+            onMuteStateChanged?(true)
+            showToast(tr("🔇 МИКРОФОН ВЫКЛЮЧЕН (⌘⇧M)", "🔇 MIC MUTED (⌘⇧M)"))
+        } else {
+            let restore = preMuteRodeDsp ?? rodeDsp
+            isGlobalMuted = false
+            DispatchQueue.global(qos: .userInteractive).async { [weak self] in
+                self?.rodeBridge.setHardwareMuteSync(false, restore: restore)
+            }
+            obsBridge.setObsMicMuted(false)
+            onMuteStateChanged?(false)
+            showToast(tr("🎙 Микрофон включён", "🎙 Mic Live"))
         }
     }
 
-    // MARK: - RØDE NT1 5th Gen Hardware Sync & Live Control
+    // MARK: - OBS AI RNNoise Turbo Toggle
+    func toggleObsRnnoise() {
+        guard obsConnected else {
+            showToast(tr("⚠ Откройте OBS Studio для AI RNNoise", "⚠ Open OBS Studio for AI RNNoise"))
+            return
+        }
+        let target = !obsRnnoiseEnabled
+        obsBridge.setRnnoiseEnabled(target)
+        showToast(target ? tr("🚧 OBS AI RNNoise ВКЛ (режет перфоратор в речи)", "🚧 OBS AI RNNoise ON") : tr("✨ OBS AI RNNoise ВЫКЛ (чистый RØDE)", "✨ OBS AI RNNoise OFF"))
+    }
+
+    // MARK: - RØDE NT1 5th Gen Hardware Sync, A/B Comparison & Live Control
     func syncFromRodeHardware(silent: Bool = false) {
         rodeSyncing = true
         rodeBridge.readHardwareSettings { [weak self] ok, settings in
@@ -1225,8 +1440,9 @@ final class AudioAnalyzerEngine: ObservableObject {
             if ok, let st = settings {
                 self.rodeDsp = st
                 self.lastWrittenRodeDsp = st
+                if self.activeABSlot == "A" { self.slotADsp = st } else { self.slotBDsp = st }
                 if !silent {
-                    self.showToast(self.tr("✓ Считано с RØDE NT1 (Gain \(Int(st.inputGainDb))dB, HPF \(st.hpfLabel), Gate \(Int(st.gateThresholdDb))dB)", "✓ Synced from RØDE NT1"))
+                    self.showToast(self.tr("✓ Считано с RØDE NT1 (Gain \(Int(st.inputGainDb))dB, HPF \(st.hpfLabel))", "✓ Synced from RØDE NT1"))
                 }
             } else if !silent {
                 self.showToast(self.tr("RØDE NT1 5th Gen не найден по USB", "RØDE NT1 5th Gen USB not found"))
@@ -1234,17 +1450,45 @@ final class AudioAnalyzerEngine: ObservableObject {
         }
     }
 
+    func switchABSlot(_ slot: String) {
+        guard slot != activeABSlot else { return }
+        if activeABSlot == "A" { slotADsp = rodeDsp } else { slotBDsp = rodeDsp }
+        activeABSlot = slot
+        let target = slot == "A" ? slotADsp : slotBDsp
+        applyRodeSettingsNow(target, label: tr("Слот \(slot)", "Slot \(slot)"))
+        scheduleSaveConfig()
+    }
+
+    func copyCurrentABToOther() {
+        if activeABSlot == "A" {
+            slotADsp = rodeDsp; slotBDsp = rodeDsp
+            showToast(tr("📋 Слот A → скопирован в B", "📋 Copied A → B"))
+        } else {
+            slotBDsp = rodeDsp; slotADsp = rodeDsp
+            showToast(tr("📋 Слот B → скопирован в A", "📋 Copied B → A"))
+        }
+        scheduleSaveConfig()
+    }
+
     func updateRodeParam(_ mutate: (inout RodeDSPSettings) -> Void) {
+        if isGlobalMuted { toggleGlobalMute() }
         if previousRodeDsp == nil { previousRodeDsp = rodeDsp }
         mutate(&rodeDsp)
+        if activeABSlot == "A" { slotADsp = rodeDsp } else { slotBDsp = rodeDsp }
         activeProfileId = ""
         activeMicPresetId = ""
         scheduleRodeHardwareWrite(immediate: false)
     }
 
     func applyRodeSettingsNow(_ target: RodeDSPSettings, label: String? = nil) {
+        if isGlobalMuted {
+            isGlobalMuted = false
+            obsBridge.setObsMicMuted(false)
+            onMuteStateChanged?(false)
+        }
         previousRodeDsp = rodeDsp
         rodeDsp = target
+        if activeABSlot == "A" { slotADsp = target } else { slotBDsp = target }
         rodeWriteWorkItem?.cancel()
         rodeSyncing = true
         let prev = lastWrittenRodeDsp
@@ -1254,9 +1498,7 @@ final class AudioAnalyzerEngine: ObservableObject {
             self.rodeConnected = ok
             if ok {
                 self.lastWrittenRodeDsp = target
-                if let lbl = label {
-                    self.showToast("✓ RØDE NT1: \(lbl)")
-                }
+                if let lbl = label { self.showToast("✓ RØDE NT1: \(lbl)") }
             } else {
                 self.showToast(self.tr("⚠ Ошибка записи в RØDE NT1", "⚠ Failed writing to RØDE NT1"))
             }
@@ -1265,8 +1507,7 @@ final class AudioAnalyzerEngine: ObservableObject {
 
     func undoLastRodeChange() {
         guard let prev = previousRodeDsp else { return }
-        let restore = prev
-        previousRodeDsp = nil
+        let restore = prev; previousRodeDsp = nil
         applyRodeSettingsNow(restore, label: tr("Откат настроек", "Restored previous DSP"))
     }
 
@@ -1286,11 +1527,12 @@ final class AudioAnalyzerEngine: ObservableObject {
         DispatchQueue.main.asyncAfter(deadline: .now() + (immediate ? 0.01 : 0.14), execute: work)
     }
 
-    // MARK: - Room Profiles
+    // MARK: - Room Profiles & Mic Voice Presets
     func applyRoomProfile(_ profile: RoomAudioProfile) {
         activeProfileId = profile.id
-        if let lt = LoudnessTarget(rawValue: profile.loudnessTarget) {
-            loudnessTarget = lt
+        if let lt = LoudnessTarget(rawValue: profile.loudnessTarget) { loudnessTarget = lt }
+        if let rn = profile.preferObsRnnoise, obsConnected {
+            obsBridge.setRnnoiseEnabled(rn)
         }
         applyRodeSettingsNow(profile.dsp, label: profile.name)
         scheduleSaveConfig()
@@ -1300,19 +1542,13 @@ final class AudioAnalyzerEngine: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let profile = RoomAudioProfile(
-            id: "room_\(UUID().uuidString.prefix(8))",
-            name: trimmed,
-            icon: "door.left.hand.open",
-            isBuiltIn: false,
+            id: "room_\(UUID().uuidString.prefix(8))", name: trimmed, icon: "door.left.hand.open", isBuiltIn: false,
             subtitle: "HPF \(rodeDsp.hpfLabel) • Gate \(Int(rodeDsp.gateThresholdDb))dB • Gain \(Int(rodeDsp.inputGainDb))dB",
-            loudnessTarget: loudnessTarget.rawValue,
-            measuredFloorDb: Double(noiseFloorDb.rounded()),
-            dsp: rodeDsp
+            loudnessTarget: loudnessTarget.rawValue, measuredFloorDb: Double(noiseFloorDb.rounded()),
+            preferObsRnnoise: obsRnnoiseEnabled, dsp: rodeDsp
         )
-        customProfiles.append(profile)
-        activeProfileId = profile.id
-        newRoomName = ""
-        showSaveRoomPopover = false
+        customProfiles.append(profile); activeProfileId = profile.id
+        newRoomName = ""; showSaveRoomPopover = false
         scheduleSaveConfig()
         showToast(tr("💾 Комната «\(trimmed)» сохранена", "💾 Room '\(trimmed)' saved"))
     }
@@ -1323,29 +1559,19 @@ final class AudioAnalyzerEngine: ObservableObject {
         scheduleSaveConfig()
     }
 
-    // MARK: - Mic / Vocal Character Presets (Preserves Active Room HPF & Noise Gate!)
     func applyMicVoicePreset(_ preset: MicVoicePreset) {
         activeMicPresetId = preset.id
         var next = rodeDsp
         if let full = preset.fullDspOverride {
-            // Custom user mic preset restores its saved full DSP snapshot
             next = full
             applyRodeSettingsNow(next, label: tr("Мик: \(preset.name)", "Mic: \(preset.name)"))
         } else {
-            // Built-in voice presets layer cleanly over your Room's HPF & Noise Gate!
-            next.compEnabled = preset.compEnabled
-            next.compThresholdDb = preset.compThresholdDb
-            next.compRatio = preset.compRatio
-            next.compAttackMs = preset.compAttackMs
-            next.compReleaseMs = preset.compReleaseMs
-            next.compGainDb = preset.compGainDb
-            next.exciterEnabled = preset.exciterEnabled
-            next.exciterMixPct = preset.exciterMixPct
-            next.exciterTuneHz = preset.exciterTuneHz
+            next.compEnabled = preset.compEnabled; next.compThresholdDb = preset.compThresholdDb
+            next.compRatio = preset.compRatio; next.compAttackMs = preset.compAttackMs
+            next.compReleaseMs = preset.compReleaseMs; next.compGainDb = preset.compGainDb
+            next.exciterEnabled = preset.exciterEnabled; next.exciterMixPct = preset.exciterMixPct; next.exciterTuneHz = preset.exciterTuneHz
 
-            let inConstruction = (activeProfileId == "builtin_construction")
-            if inConstruction && preset.bigBottomEnabled {
-                // Keep construction rumble protection intact while still giving warmth
+            if activeProfileId == "builtin_construction" && preset.bigBottomEnabled {
                 next.bigBottomEnabled = true
                 next.bigBottomDrivePct = min(28.0, preset.bigBottomDrivePct)
                 next.bigBottomTuneHz = max(95.0, preset.bigBottomTuneHz)
@@ -1364,29 +1590,16 @@ final class AudioAnalyzerEngine: ObservableObject {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         let preset = MicVoicePreset(
-            id: "mic_custom_\(UUID().uuidString.prefix(8))",
-            name: trimmed,
-            icon: "dial.high.fill",
-            isBuiltIn: false,
-            subtitle: "Gain \(Int(rodeDsp.inputGainDb))dB • HPF \(rodeDsp.hpfLabel) • Comp \(String(format: "%.1f", rodeDsp.compRatio)):1 • BB \(Int(rodeDsp.bigBottomDrivePct))% • AE \(Int(rodeDsp.exciterMixPct))%",
-            compEnabled: rodeDsp.compEnabled,
-            compThresholdDb: rodeDsp.compThresholdDb,
-            compRatio: rodeDsp.compRatio,
-            compAttackMs: rodeDsp.compAttackMs,
-            compReleaseMs: rodeDsp.compReleaseMs,
-            compGainDb: rodeDsp.compGainDb,
-            bigBottomEnabled: rodeDsp.bigBottomEnabled,
-            bigBottomDrivePct: rodeDsp.bigBottomDrivePct,
-            bigBottomTuneHz: rodeDsp.bigBottomTuneHz,
-            exciterEnabled: rodeDsp.exciterEnabled,
-            exciterMixPct: rodeDsp.exciterMixPct,
-            exciterTuneHz: rodeDsp.exciterTuneHz,
+            id: "mic_custom_\(UUID().uuidString.prefix(8))", name: trimmed, icon: "dial.high.fill", isBuiltIn: false,
+            subtitle: "Gain \(Int(rodeDsp.inputGainDb))dB • HPF \(rodeDsp.hpfLabel) • Comp \(String(format: "%.1f", rodeDsp.compRatio)):1",
+            compEnabled: rodeDsp.compEnabled, compThresholdDb: rodeDsp.compThresholdDb, compRatio: rodeDsp.compRatio,
+            compAttackMs: rodeDsp.compAttackMs, compReleaseMs: rodeDsp.compReleaseMs, compGainDb: rodeDsp.compGainDb,
+            bigBottomEnabled: rodeDsp.bigBottomEnabled, bigBottomDrivePct: rodeDsp.bigBottomDrivePct, bigBottomTuneHz: rodeDsp.bigBottomTuneHz,
+            exciterEnabled: rodeDsp.exciterEnabled, exciterMixPct: rodeDsp.exciterMixPct, exciterTuneHz: rodeDsp.exciterTuneHz,
             fullDspOverride: rodeDsp
         )
-        customMicPresets.append(preset)
-        activeMicPresetId = preset.id
-        newMicPresetName = ""
-        showSaveMicPresetPopover = false
+        customMicPresets.append(preset); activeMicPresetId = preset.id
+        newMicPresetName = ""; showSaveMicPresetPopover = false
         scheduleSaveConfig()
         showToast(tr("💾 Пресет мик. «\(trimmed)» сохранён", "💾 Mic preset '\(trimmed)' saved"))
     }
@@ -1397,7 +1610,104 @@ final class AudioAnalyzerEngine: ObservableObject {
         scheduleSaveConfig()
     }
 
-    // MARK: - General Actions
+    // MARK: - Instant 5s Voice Check (Record 5s -> Immediate Playback into Headphones!)
+    func toggleVoiceCheck() {
+        if !voiceCheckPhase.isEmpty {
+            stopVoiceCheck()
+            return
+        }
+        if sourceMode != .microphone { setSourceMode(.microphone) }
+        os_unfair_lock_lock(&ringLock)
+        voiceCheckSamples.removeAll(keepingCapacity: true)
+        voiceCheckSamples.reserveCapacity(Int(activeSampleRate * 5.2))
+        isRecordingVoiceCheck = true
+        os_unfair_lock_unlock(&ringLock)
+
+        voiceCheckPhase = "recording"
+        voiceCheckCountdown = 5
+        voiceCheckTimer?.invalidate()
+        var secsLeft = 5
+        voiceCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            secsLeft -= 1
+            if secsLeft > 0 {
+                self.voiceCheckCountdown = secsLeft
+            } else {
+                t.invalidate()
+                self.finishRecordingAndPlayVoiceCheck()
+            }
+        }
+    }
+
+    private func finishRecordingAndPlayVoiceCheck() {
+        os_unfair_lock_lock(&ringLock)
+        isRecordingVoiceCheck = false
+        let pcm = voiceCheckSamples
+        voiceCheckSamples.removeAll()
+        os_unfair_lock_unlock(&ringLock)
+
+        guard pcm.count > 4000 else {
+            stopVoiceCheck()
+            showToast(tr("Нет сигнала для воспроизведения", "No audio captured"))
+            return
+        }
+        let tmpUrl = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("mr_audio_voicecheck.wav")
+        try? FileManager.default.removeItem(at: tmpUrl)
+        if let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: activeSampleRate, channels: 1, interleaved: false),
+           let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(pcm.count)) {
+            buf.frameLength = AVAudioFrameCount(pcm.count)
+            if let ch = buf.floatChannelData?[0] {
+                pcm.withUnsafeBufferPointer { src in ch.update(from: src.baseAddress!, count: pcm.count) }
+            }
+            if let file = try? AVAudioFile(forWriting: tmpUrl, settings: format.settings) {
+                try? file.write(from: buf)
+                if let player = try? AVAudioPlayer(contentsOf: tmpUrl) {
+                    player.delegate = self
+                    voicePlayer = player
+                    voiceCheckPhase = "playing"
+                    voiceCheckCountdown = Int(ceil(player.duration))
+                    player.play()
+                    var rem = voiceCheckCountdown
+                    voiceCheckTimer?.invalidate()
+                    voiceCheckTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] t in
+                        guard let self = self else { t.invalidate(); return }
+                        rem -= 1
+                        if rem > 0 && self.voicePlayer?.isPlaying == true {
+                            self.voiceCheckCountdown = rem
+                        } else {
+                            t.invalidate()
+                        }
+                    }
+                    return
+                }
+            }
+        }
+        stopVoiceCheck()
+    }
+
+    func stopVoiceCheck() {
+        voiceCheckTimer?.invalidate(); voiceCheckTimer = nil
+        os_unfair_lock_lock(&ringLock)
+        isRecordingVoiceCheck = false
+        voiceCheckSamples.removeAll()
+        os_unfair_lock_unlock(&ringLock)
+        voicePlayer?.stop(); voicePlayer = nil
+        voiceCheckPhase = ""; voiceCheckCountdown = 0
+    }
+
+    func audioPlayerDidFinishPlaying(_ player: AVAudioPlayer, successfully flag: Bool) {
+        DispatchQueue.main.async { self.stopVoiceCheck() }
+    }
+
+    // MARK: - Source Switching (Microphone vs macOS System Audio via ScreenCaptureKit)
+    func setSourceMode(_ mode: AudioSourceMode) {
+        guard mode != sourceMode else { return }
+        sourceMode = mode
+        systemAudioPermissionError = ""
+        resetLoudnessStats()
+        restartEngine()
+    }
+
     func refreshDevices() {
         let list = CoreAudioHelper.listInputDevices()
         devices = list
@@ -1406,65 +1716,32 @@ final class AudioAnalyzerEngine: ObservableObject {
                 selectedDeviceUID = rode.uid
             } else {
                 let defId = CoreAudioHelper.defaultInputDeviceID()
-                if let def = list.first(where: { $0.id == defId }) ?? list.first {
-                    selectedDeviceUID = def.uid
-                }
+                if let def = list.first(where: { $0.id == defId }) ?? list.first { selectedDeviceUID = def.uid }
             }
         }
         if let dev = list.first(where: { $0.uid == selectedDeviceUID }) {
-            activeDeviceName = dev.name
-            activeSampleRate = dev.sampleRate
-            activeChannels = dev.inputChannels
+            activeDeviceName = dev.name; activeSampleRate = dev.sampleRate; activeChannels = dev.inputChannels
         }
     }
 
     func selectDevice(uid: String) {
         selectedDeviceUID = uid
+        sourceMode = .microphone
         if let dev = devices.first(where: { $0.uid == uid }) {
-            activeDeviceName = dev.name
-            activeSampleRate = dev.sampleRate
-            activeChannels = dev.inputChannels
+            activeDeviceName = dev.name; activeSampleRate = dev.sampleRate; activeChannels = dev.inputChannels
         }
-        resetLoudnessStats()
-        scheduleSaveConfig()
-        restartEngine()
+        resetLoudnessStats(); scheduleSaveConfig(); restartEngine()
     }
 
-    func setLayoutMode(_ mode: MeterLayoutMode) {
-        layoutMode = mode
-        onLayoutChanged?(mode, showRodeDrawer)
-        scheduleSaveConfig()
-    }
-
-    func toggleRodeDrawer() {
-        showRodeDrawer.toggle()
-        onLayoutChanged?(layoutMode, showRodeDrawer)
-        scheduleSaveConfig()
-    }
-
-    func setAlwaysOnTop(_ enabled: Bool) {
-        alwaysOnTop = enabled
-        onAlwaysOnTopChanged?(enabled)
-        scheduleSaveConfig()
-    }
-
-    func setOpacity(_ val: Double) {
-        windowOpacity = val
-        onOpacityChanged?(val)
-        scheduleSaveConfig()
-    }
-
-    func toggleFreeze() {
-        isFrozen.toggle()
-        if isFrozen { frozenSpectrum = spectrumCurve }
-    }
+    func setLayoutMode(_ mode: MeterLayoutMode) { layoutMode = mode; onLayoutChanged?(mode, showRodeDrawer); scheduleSaveConfig() }
+    func toggleRodeDrawer() { showRodeDrawer.toggle(); onLayoutChanged?(layoutMode, showRodeDrawer); scheduleSaveConfig() }
+    func setAlwaysOnTop(_ enabled: Bool) { alwaysOnTop = enabled; onAlwaysOnTopChanged?(enabled); scheduleSaveConfig() }
+    func setOpacity(_ val: Double) { windowOpacity = val; onOpacityChanged?(val); scheduleSaveConfig() }
+    func toggleFreeze() { isFrozen.toggle(); if isFrozen { frozenSpectrum = spectrumCurve } }
 
     func resetLoudnessStats() {
-        integratedEnergySum = 0
-        integratedBlockCount = 0
-        integratedLufs = -60.0
-        peakHoldDb = -60.0
-        isClipping = false
+        integratedEnergySum = 0; integratedBlockCount = 0; integratedLufs = -60.0
+        peakHoldDb = -60.0; isClipping = false
         lufsHistory = Array(repeating: -60.0, count: Self.lufsHistoryCount)
         spectrumPeaks = Array(repeating: 0, count: Self.spectrumBins)
     }
@@ -1479,51 +1756,38 @@ final class AudioAnalyzerEngine: ObservableObject {
     func saveLast10SecondsClip() {
         os_unfair_lock_lock(&ringLock)
         let count = min(clipFilled, clipBufferCapacity)
-        guard count > 4000 else {
-            os_unfair_lock_unlock(&ringLock)
-            showToast(tr("Буфер пока пуст", "Audio buffer empty"))
-            return
-        }
+        guard count > 4000 else { os_unfair_lock_unlock(&ringLock); showToast(tr("Буфер пока пуст", "Audio buffer empty")); return }
         var pcm = [Float](repeating: 0, count: count)
-        var idx = clipWriteIdx - count
-        if idx < 0 { idx += clipBufferCapacity }
+        var idx = clipWriteIdx - count; if idx < 0 { idx += clipBufferCapacity }
         for i in 0..<count { pcm[i] = clipRing[(idx + i) % clipBufferCapacity] }
         os_unfair_lock_unlock(&ringLock)
 
         let dir = "\(NSHomeDirectory())/Desktop/PixelProCam/Captures"
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let df = DateFormatter()
-        df.dateFormat = "yyyy-MM-dd_HH-mm-ss"
+        let df = DateFormatter(); df.dateFormat = "yyyy-MM-dd_HH-mm-ss"
         let outUrl = URL(fileURLWithPath: "\(dir)/AudioCheck_\(df.string(from: Date())).wav")
 
         if let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: activeSampleRate, channels: 1, interleaved: false),
            let buf = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(count)) {
             buf.frameLength = AVAudioFrameCount(count)
-            if let ch = buf.floatChannelData?[0] {
-                pcm.withUnsafeBufferPointer { src in ch.update(from: src.baseAddress!, count: count) }
-            }
+            if let ch = buf.floatChannelData?[0] { pcm.withUnsafeBufferPointer { src in ch.update(from: src.baseAddress!, count: count) } }
             if let file = try? AVAudioFile(forWriting: outUrl, settings: format.settings) {
                 try? file.write(from: buf)
                 showToast(tr("💾 Сохранено 10с → Captures", "💾 Saved 10s WAV → Captures"))
-                NSWorkspace.shared.activateFileViewerSelecting([outUrl])
-                return
+                NSWorkspace.shared.activateFileViewerSelecting([outUrl]); return
             }
         }
         showToast(tr("Ошибка сохранения WAV", "WAV save failed"))
     }
 
-    // MARK: - CoreAudio / AVAudioEngine Capture
+    // MARK: - Audio Capture Engine (Mic AVAudioEngine OR System ScreenCaptureKit)
     func requestMicAndStart() {
         switch AVCaptureDevice.authorizationStatus(for: .audio) {
         case .authorized:
-            permissionDenied = false
-            startEngine()
+            permissionDenied = false; startEngine()
         case .notDetermined:
             AVCaptureDevice.requestAccess(for: .audio) { [weak self] granted in
-                DispatchQueue.main.async {
-                    self?.permissionDenied = !granted
-                    if granted { self?.startEngine() }
-                }
+                DispatchQueue.main.async { self?.permissionDenied = !granted; if granted { self?.startEngine() } }
             }
         default:
             permissionDenied = true
@@ -1534,58 +1798,100 @@ final class AudioAnalyzerEngine: ObservableObject {
 
     func stopEngine() {
         displayTimer?.invalidate(); displayTimer = nil
-        if let eng = audioEngine {
-            eng.inputNode.removeTap(onBus: 0)
-            eng.stop()
-        }
+        if let eng = audioEngine { eng.inputNode.removeTap(onBus: 0); eng.stop() }
         audioEngine = nil
+        sysAudioTap?.stop(); sysAudioTap = nil
         isRunning = false
+    }
+
+    private func pushSamplesIntoRing(left: UnsafePointer<Float>, right: UnsafePointer<Float>, count n: Int) {
+        os_unfair_lock_lock(&ringLock)
+        let rLen = ringL.count
+        var clapCapturedDone = false
+        for i in 0..<n {
+            let l = left[i]; let r = right[i]
+            let mono = 0.5 * (l + r)
+            ringL[ringWriteIdx] = l; ringR[ringWriteIdx] = r
+            ringWriteIdx = (ringWriteIdx + 1) % rLen
+            clipRing[clipWriteIdx] = mono
+            clipWriteIdx = (clipWriteIdx + 1) % clipBufferCapacity
+
+            if isRecordingVoiceCheck { voiceCheckSamples.append(mono) }
+
+            // Clap RT60 impulse detection & tail capture
+            if isWaitingForClap {
+                let absVal = abs(mono)
+                let floorLin = powf(10.0, noiseFloorEstimate / 20.0)
+                if absVal > max(0.16, floorLin * 8.0) { // Sharp clap > -16 dBFS & +18 dB over room floor
+                    isWaitingForClap = false
+                    isCapturingClapTail = true
+                    clapTailSamples.removeAll(keepingCapacity: true)
+                    clapTailSamples.reserveCapacity(clapTailTargetSamples)
+                    clapTailSamples.append(mono)
+                }
+            } else if isCapturingClapTail {
+                clapTailSamples.append(mono)
+                if clapTailSamples.count >= clapTailTargetSamples {
+                    isCapturingClapTail = false
+                    clapCapturedDone = true
+                }
+            }
+        }
+        clipFilled = min(clipBufferCapacity, clipFilled + n)
+        os_unfair_lock_unlock(&ringLock)
+
+        if clapCapturedDone {
+            DispatchQueue.main.async { [weak self] in self?.finishClapEchoTest() }
+        }
     }
 
     func startEngine() {
         stopEngine()
+        if sourceMode == .systemAudio {
+            activeSampleRate = 48000; activeChannels = 2
+            rebuildBinTables(sampleRate: 48000)
+            let tap = SystemAudioTap()
+            tap.onAudioSamples = { [weak self] l, r in
+                l.withUnsafeBufferPointer { lb in
+                    r.withUnsafeBufferPointer { rb in
+                        guard let lp = lb.baseAddress, let rp = rb.baseAddress else { return }
+                        self?.pushSamplesIntoRing(left: lp, right: rp, count: min(l.count, r.count))
+                    }
+                }
+            }
+            tap.onPermissionError = { [weak self] msg in
+                self?.systemAudioPermissionError = msg
+                self?.isRunning = false
+            }
+            sysAudioTap = tap
+            tap.start()
+            isRunning = true
+            startDisplayLoop()
+            return
+        }
+
         let engine = AVAudioEngine()
         let inputNode = engine.inputNode
-
-        if let targetDev = devices.first(where: { $0.uid == selectedDeviceUID }),
-           let au = inputNode.audioUnit {
+        if let targetDev = devices.first(where: { $0.uid == selectedDeviceUID }), let au = inputNode.audioUnit {
             var devId = targetDev.id
             AudioUnitSetProperty(au, kAudioOutputUnitProperty_CurrentDevice, kAudioUnitScope_Global, 0, &devId, UInt32(MemoryLayout<AudioDeviceID>.size))
         }
-
         let fmt = inputNode.outputFormat(forBus: 0)
         guard fmt.sampleRate > 0 && fmt.channelCount > 0 else { return }
-        activeSampleRate = fmt.sampleRate
-        activeChannels = Int(fmt.channelCount)
+        activeSampleRate = fmt.sampleRate; activeChannels = Int(fmt.channelCount)
         rebuildBinTables(sampleRate: fmt.sampleRate)
 
         inputNode.installTap(onBus: 0, bufferSize: 1024, format: fmt) { [weak self] buffer, _ in
             guard let self = self, let chData = buffer.floatChannelData else { return }
-            let n = Int(buffer.frameLength)
-            let chCount = Int(buffer.format.channelCount)
-            guard n > 0 else { return }
-
-            os_unfair_lock_lock(&self.ringLock)
-            let rLen = self.ringL.count
+            let n = Int(buffer.frameLength); guard n > 0 else { return }
             let c0 = chData[0]
-            let c1 = chCount >= 2 ? chData[1] : chData[0]
-            for i in 0..<n {
-                let l = c0[i]; let r = c1[i]
-                let mono = 0.5 * (l + r)
-                self.ringL[self.ringWriteIdx] = l
-                self.ringR[self.ringWriteIdx] = r
-                self.ringWriteIdx = (self.ringWriteIdx + 1) % rLen
-                self.clipRing[self.clipWriteIdx] = mono
-                self.clipWriteIdx = (self.clipWriteIdx + 1) % self.clipBufferCapacity
-            }
-            self.clipFilled = min(self.clipBufferCapacity, self.clipFilled + n)
-            os_unfair_lock_unlock(&self.ringLock)
+            let c1 = buffer.format.channelCount >= 2 ? chData[1] : chData[0]
+            self.pushSamplesIntoRing(left: c0, right: c1, count: n)
         }
 
         do {
             try engine.start()
-            audioEngine = engine
-            isRunning = true
+            audioEngine = engine; isRunning = true
             startDisplayLoop()
         } catch {
             isRunning = false
@@ -1596,23 +1902,19 @@ final class AudioAnalyzerEngine: ObservableObject {
         let nyquist = sampleRate / 2.0
         let binHz = sampleRate / Double(fftSize)
         let maxBin = fftSize / 2 - 1
-
         func buildLogBands(count: Int, minHz: Double, maxHz: Double) -> ([(Int, Int)], [Float]) {
-            var ranges: [(Int, Int)] = []
-            var centers: [Float] = []
+            var ranges: [(Int, Int)] = []; var centers: [Float] = []
             for i in 0..<count {
                 let f0 = minHz * pow(maxHz / minHz, Double(i) / Double(count))
                 let f1 = minHz * pow(maxHz / minHz, Double(i + 1) / Double(count))
                 let b0 = max(1, min(maxBin, Int(floor(f0 / binHz))))
                 let b1 = max(b0, min(maxBin, Int(ceil(f1 / binHz))))
-                ranges.append((b0, b1))
-                centers.append(Float(sqrt(f0 * f1)))
+                ranges.append((b0, b1)); centers.append(Float(sqrt(f0 * f1)))
             }
             return (ranges, centers)
         }
         let (rSpec, cSpec) = buildLogBands(count: Self.spectrumBins, minHz: 25.0, maxHz: min(20000.0, nyquist))
-        specBinRanges = rSpec
-        specBandCenterHz = cSpec
+        specBinRanges = rSpec; specBandCenterHz = cSpec
         let (rWf, _) = buildLogBands(count: Self.spectrogramRows, minHz: 45.0, maxHz: min(16000.0, nyquist))
         waterfallBinRanges = rWf
     }
@@ -1630,8 +1932,7 @@ final class AudioAnalyzerEngine: ObservableObject {
     private func freqToNoteName(_ hz: Double) -> String {
         guard hz >= 30.0 && hz <= 18000.0 else { return "—" }
         let midi = Int(round(69.0 + 12.0 * log2(hz / 440.0)))
-        let name = Self.noteNames[((midi % 12) + 12) % 12]
-        return "\(name)\((midi / 12) - 1)"
+        return "\(Self.noteNames[((midi % 12) + 12) % 12])\((midi / 12) - 1)"
     }
 
     private func processAudioFrame() {
@@ -1639,30 +1940,21 @@ final class AudioAnalyzerEngine: ObservableObject {
         var samplesR = [Float](repeating: 0, count: fftSize)
         os_unfair_lock_lock(&ringLock)
         let rLen = ringL.count
-        var startIdx = ringWriteIdx - fftSize
-        if startIdx < 0 { startIdx += rLen }
-        for i in 0..<fftSize {
-            let p = (startIdx + i) % rLen
-            samplesL[i] = ringL[p]
-            samplesR[i] = ringR[p]
-        }
+        var startIdx = ringWriteIdx - fftSize; if startIdx < 0 { startIdx += rLen }
+        for i in 0..<fftSize { let p = (startIdx + i) % rLen; samplesL[i] = ringL[p]; samplesR[i] = ringR[p] }
         os_unfair_lock_unlock(&ringLock)
 
         var mono = [Float](repeating: 0, count: fftSize)
         for i in 0..<fftSize { mono[i] = 0.5 * (samplesL[i] + samplesR[i]) }
 
-        let recentCount = 800
-        let recentOffset = fftSize - recentCount
+        let recentCount = 800; let recentOffset = fftSize - recentCount
         var maxAbs: Float = 0; var sumSq: Float = 0; var kwSumSq: Float = 0
         var sumLR: Float = 0; var sumLL: Float = 0; var sumRR: Float = 0
-
         for i in recentOffset..<fftSize {
             let m = mono[i]; let l = samplesL[i]; let r = samplesR[i]
-            let a = max(abs(l), abs(r))
-            if a > maxAbs { maxAbs = a }
+            let a = max(abs(l), abs(r)); if a > maxAbs { maxAbs = a }
             sumSq += m * m
-            let ks = kwHP.process(kwShelf.process(m))
-            kwSumSq += ks * ks
+            let ks = kwHP.process(kwShelf.process(m)); kwSumSq += ks * ks
             sumLR += l * r; sumLL += l * l; sumRR += r * r
         }
 
@@ -1672,33 +1964,44 @@ final class AudioAnalyzerEngine: ObservableObject {
         let corrDenom = sqrt(sumLL * sumRR)
         let curCorr: Float = corrDenom > 1e-9 ? max(-1, min(1, sumLR / corrDenom)) : 1.0
 
+        // Live Noise Gate HUD status (with realistic hysteresis + hold tracking!)
+        let gateThresh = Float(rodeDsp.gateThresholdDb)
+        let closeThresh = gateThresh + Float(rodeDsp.gateHysteresisDb)
+        if !rodeDsp.gateEnabled {
+            isGateOpen = true
+            gateNearBreakthrough = false
+        } else if curPeakDb >= gateThresh {
+            isGateOpen = true
+            gateHoldFrames = max(3, Int((rodeDsp.gateHoldMs + rodeDsp.gateReleaseMs * 0.4) / 16.6))
+            gateNearBreakthrough = false
+        } else if isGateOpen && (curPeakDb >= closeThresh || gateHoldFrames > 0) {
+            if gateHoldFrames > 0 { gateHoldFrames -= 1 }
+            isGateOpen = true
+            gateNearBreakthrough = false
+        } else {
+            isGateOpen = false
+            gateNearBreakthrough = (curPeakDb >= gateThresh - 4.5)
+        }
+
         let frameKwPwr = kwSumSq / Float(recentCount)
         momentaryRing[momentaryIdx] = frameKwPwr; momentaryIdx = (momentaryIdx + 1) % momentaryRing.count
         shortTermRing[shortTermIdx] = frameKwPwr; shortTermIdx = (shortTermIdx + 1) % shortTermRing.count
-
         let momMean = momentaryRing.reduce(0, +) / Float(momentaryRing.count)
         let stMean  = shortTermRing.reduce(0, +) / Float(shortTermRing.count)
         let momLufs = max(-70.0, -0.691 + 10.0 * log10(max(momMean, 1e-10)))
         let stLufs  = max(-70.0, -0.691 + 10.0 * log10(max(stMean, 1e-10)))
 
-        if momLufs > -45.0 {
-            integratedEnergySum += Double(frameKwPwr)
-            integratedBlockCount += 1
-        }
+        if momLufs > -45.0 { integratedEnergySum += Double(frameKwPwr); integratedBlockCount += 1 }
         let intLufs: Float = integratedBlockCount > 5
             ? max(-70.0, Float(-0.691 + 10.0 * log10(max(integratedEnergySum / Double(integratedBlockCount), 1e-10))))
             : stLufs
         let plr = (stLufs > -50.0) ? max(0, min(30, peakHoldDb - stLufs)) : 0
 
-        if curRmsDb < noiseFloorEstimate {
-            noiseFloorEstimate = noiseFloorEstimate * 0.90 + curRmsDb * 0.10
-        } else {
-            noiseFloorEstimate = noiseFloorEstimate * 0.996 + curRmsDb * 0.004
-        }
+        if curRmsDb < noiseFloorEstimate { noiseFloorEstimate = noiseFloorEstimate * 0.90 + curRmsDb * 0.10 }
+        else { noiseFloorEstimate = noiseFloorEstimate * 0.996 + curRmsDb * 0.004 }
 
-        if curPeakDb >= peakHoldDb {
-            peakHoldDb = curPeakDb; peakHoldTimer = 90
-        } else if peakHoldTimer > 0 { peakHoldTimer -= 1 }
+        if curPeakDb >= peakHoldDb { peakHoldDb = curPeakDb; peakHoldTimer = 90 }
+        else if peakHoldTimer > 0 { peakHoldTimer -= 1 }
         else { peakHoldDb = max(curPeakDb, peakHoldDb - 0.30) }
 
         if curPeakDb > -0.8 { isClipping = true; clipHoldTimer = 90 }
@@ -1714,12 +2017,10 @@ final class AudioAnalyzerEngine: ObservableObject {
         for i in 0..<Self.oscPointsCount { newOsc[i] = mono[min(fftSize - 1, zeroCrossIdx + i * 2)] }
 
         // Stereo Goniometer XY
-        var newXY: [(Float, Float)] = []
-        newXY.reserveCapacity(Self.stereoPointsCount)
+        var newXY: [(Float, Float)] = []; newXY.reserveCapacity(Self.stereoPointsCount)
         let stepXY = recentCount / Self.stereoPointsCount
         for i in 0..<Self.stereoPointsCount {
-            let idx = recentOffset + i * stepXY
-            let l = samplesL[idx]; let r = samplesR[idx]
+            let idx = recentOffset + i * stepXY; let l = samplesL[idx]; let r = samplesR[idx]
             newXY.append(((l - r) * 0.7071, (l + r) * 0.7071))
         }
 
@@ -1727,16 +2028,12 @@ final class AudioAnalyzerEngine: ObservableObject {
         var windowed = [Float](repeating: 0, count: fftSize)
         vDSP_vmul(mono, 1, hannWindow, 1, &windowed, 1, vDSP_Length(fftSize))
         let halfN = fftSize / 2
-        var realp = [Float](repeating: 0, count: halfN)
-        var imagp = [Float](repeating: 0, count: halfN)
-        var mags = [Float](repeating: 0, count: halfN)
-
+        var realp = [Float](repeating: 0, count: halfN); var imagp = [Float](repeating: 0, count: halfN); var mags = [Float](repeating: 0, count: halfN)
         realp.withUnsafeMutableBufferPointer { rBuf in
             imagp.withUnsafeMutableBufferPointer { iBuf in
                 var split = DSPSplitComplex(realp: rBuf.baseAddress!, imagp: iBuf.baseAddress!)
                 windowed.withUnsafeBytes { rawPtr in
-                    let cPtr = rawPtr.bindMemory(to: DSPComplex.self)
-                    vDSP_ctoz(cPtr.baseAddress!, 2, &split, 1, vDSP_Length(halfN))
+                    vDSP_ctoz(rawPtr.bindMemory(to: DSPComplex.self).baseAddress!, 2, &split, 1, vDSP_Length(halfN))
                 }
                 if let setup = fftSetup {
                     vDSP_fft_zrip(setup, &split, 1, vDSP_Length(log2(Double(fftSize))), FFTDirection(FFT_FORWARD))
@@ -1748,206 +2045,279 @@ final class AudioAnalyzerEngine: ObservableObject {
         let normScale = Float(fftSize * fftSize) / 4.0
         let binHz = Float(activeSampleRate) / Float(fftSize)
         let tiltF = Float(spectrumTilt)
-
         var magDb = [Float](repeating: -85, count: halfN)
         var domBin = 0; var domPwr: Float = 0
         var lowE: Float = 0; var midE: Float = 0; var highE: Float = 0
         var rumbleSum: Float = 0; var rumbleBins: Int = 0
 
         for i in 1..<halfN {
-            let pwr = mags[i] / normScale
-            let freq = Float(i) * binHz
+            let pwr = mags[i] / normScale; let freq = Float(i) * binHz
             if freq >= 55 && freq <= 6000 && pwr > domPwr { domPwr = pwr; domBin = i }
             if freq >= 20 && freq <= 150 { rumbleSum += pwr; rumbleBins += 1 }
-            if freq < 250 { lowE += pwr }
-            else if freq < 2400 { midE += pwr }
-            else { highE += pwr }
-
-            let amp = sqrt(max(pwr, 1e-12))
-            let tilt = tiltF * log2(max(freq / 300.0, 0.08))
-            magDb[i] = 20.0 * log10(amp) + tilt
+            if freq < 250 { lowE += pwr } else if freq < 2400 { midE += pwr } else { highE += pwr }
+            magDb[i] = 20.0 * log10(sqrt(max(pwr, 1e-12))) + tiltF * log2(max(freq / 300.0, 0.08))
         }
 
         let curRumbleDb = 10.0 * log10(max(rumbleSum / Float(max(1, rumbleBins)), 1e-12))
         rumbleEstimate = rumbleEstimate * 0.92 + curRumbleDb * 0.08
-
         let domHz = (curRmsDb > -48 && domBin > 0) ? Double(domBin) * Double(binHz) : 0
         let domNote = domHz > 0 ? freqToNoteName(domHz) : "—"
 
-        // Multi-Band Waveform
-        let lowW = sqrt(lowE) * 0.9; let midW = sqrt(midE) * 1.4; let highW = sqrt(highE) * 2.8
-        var newWave = coloredWave
-        newWave.removeFirst()
-        newWave.append(ColoredWaveSlice(amplitude: min(1.0, maxAbs * 1.35), lowWeight: lowW, midWeight: midW, highWeight: highW))
+        var newWave = coloredWave; newWave.removeFirst()
+        newWave.append(ColoredWaveSlice(amplitude: min(1.0, maxAbs * 1.35), lowWeight: sqrt(lowE) * 0.9, midWeight: sqrt(midE) * 1.4, highWeight: sqrt(highE) * 2.8))
 
-        // 64-Band Spectrum Curve
-        var newCurve = spectrumCurve
-        var newPeaks = spectrumPeaks
+        var newCurve = spectrumCurve; var newPeaks = spectrumPeaks
         for b in 0..<Self.spectrumBins {
-            let (b0, b1) = specBinRanges[b]
-            var pk: Float = -85
+            let (b0, b1) = specBinRanges[b]; var pk: Float = -85
             for k in b0...b1 { if magDb[k] > pk { pk = magDb[k] } }
             let norm = max(0, min(1, (pk + 70.0) / 66.0))
-            let prev = newCurve[b]
-            let sm = norm > prev ? (prev * 0.35 + norm * 0.65) : (prev * 0.82 + norm * 0.18)
-            newCurve[b] = sm
-            newPeaks[b] = max(sm, newPeaks[b] - 0.005)
+            let sm = norm > newCurve[b] ? (newCurve[b] * 0.35 + norm * 0.65) : (newCurve[b] * 0.82 + norm * 0.18)
+            newCurve[b] = sm; newPeaks[b] = max(sm, newPeaks[b] - 0.005)
         }
 
-        // Mel Spectrogram
         var wfCol = [Float](repeating: 0, count: Self.spectrogramRows)
         for r in 0..<Self.spectrogramRows {
-            let (b0, b1) = waterfallBinRanges[r]
-            var pk: Float = -85
+            let (b0, b1) = waterfallBinRanges[r]; var pk: Float = -85
             for k in b0...b1 { if magDb[k] > pk { pk = magDb[k] } }
             wfCol[r] = max(0, min(1, (pk + 66.0) / 60.0))
         }
-        var newSpec = spectrogram
-        newSpec.removeFirst()
-        newSpec.append(wfCol)
+        var newSpec = spectrogram; newSpec.removeFirst(); newSpec.append(wfCol)
 
-        // LUFS History
         lufsHistoryTick += 1
         var newLufsHist = lufsHistory
-        if lufsHistoryTick >= 8 {
-            lufsHistoryTick = 0
-            newLufsHist.removeFirst()
-            newLufsHist.append(stLufs)
-        }
+        if lufsHistoryTick >= 8 { lufsHistoryTick = 0; newLufsHist.removeFirst(); newLufsHist.append(stLufs) }
 
         func bandRawDb(_ f0: Float, _ f1: Float) -> Float {
-            let i0 = max(1, Int(f0 / binHz))
-            let i1 = min(halfN - 1, Int(f1 / binHz))
-            var s: Float = 0
-            for k in i0...i1 { s += mags[k] / normScale }
+            let i0 = max(1, Int(f0 / binHz)); let i1 = min(halfN - 1, Int(f1 / binHz))
+            var s: Float = 0; for k in i0...i1 { s += mags[k] / normScale }
             return 10.0 * log10(max(s / Float(max(1, i1 - i0 + 1)), 1e-12))
         }
 
-        // Acoustic Scan Sampling
         if isScanning {
             if scanPhase == "quiet" {
-                scanQuietRms.append(curRmsDb)
-                scanQuietPeaks.append(curPeakDb)
-                scanQuietRumble.append(curRumbleDb)
-                scanQuietMid.append(bandRawDb(150, 1000))
-                scanQuietHigh.append(bandRawDb(1000, 8000))
+                scanQuietRms.append(curRmsDb); scanQuietPeaks.append(curPeakDb)
+                scanQuietRumble.append(curRumbleDb); scanQuietMid.append(bandRawDb(150, 1000)); scanQuietHigh.append(bandRawDb(1000, 8000))
             } else if scanPhase == "speak" && curRmsDb > -46.0 {
                 scanSpeechLufs.append(momLufs)
                 if curPeakDb > scanSpeechPeakMax { scanSpeechPeakMax = curPeakDb }
-                scanMud.append(bandRawDb(120, 320))
-                scanPres.append(bandRawDb(2000, 5000))
-                scanSib.append(bandRawDb(5500, 9000))
+                scanMud.append(bandRawDb(120, 320)); scanPres.append(bandRawDb(2000, 5000)); scanSib.append(bandRawDb(5500, 9000))
             }
         }
 
-        // Live Noise Classification Badge + Optional Continuous Auto-Guard
         guardTick += 1
-        if curRmsDb < -26.0 && !isScanning {
-            guardQuietSamples.append(curRmsDb)
-            guardRumbleSamples.append(curRumbleDb)
+        if curRmsDb < -26.0 && !isScanning && sourceMode == .microphone && !isGlobalMuted {
+            guardQuietSamples.append(curRmsDb); guardRumbleSamples.append(curRumbleDb)
             if guardQuietSamples.count > 180 { guardQuietSamples.removeFirst() }
             if guardRumbleSamples.count > 180 { guardRumbleSamples.removeFirst() }
         }
-        if guardTick >= 60 { // once per second
+        if guardTick >= 60 {
             guardTick = 0
-            if noiseFloorEstimate > -41.0 || rumbleEstimate > -50.0 {
-                liveNoiseStatus = tr("⚠ Шум/Стройка", "⚠ High Noise")
-            } else if noiseFloorEstimate > -48.0 {
-                liveNoiseStatus = tr("Умеренный фон", "Moderate")
-            } else {
-                liveNoiseStatus = tr("Тихо", "Quiet")
-            }
+            if noiseFloorEstimate > -41.0 || rumbleEstimate > -50.0 { liveNoiseStatus = tr("⚠ Шум/Стройка", "⚠ High Noise") }
+            else if noiseFloorEstimate > -48.0 { liveNoiseStatus = tr("Умеренный фон", "Moderate") }
+            else { liveNoiseStatus = tr("Тихо", "Quiet") }
 
-            if autoAdaptiveGuard && rodeConnected && !isScanning && guardQuietSamples.count >= 120 {
+            if autoAdaptiveGuard && rodeConnected && !isScanning && !isGlobalMuted && sourceMode == .microphone && guardQuietSamples.count >= 120 {
                 let now = Date()
                 if now.timeIntervalSince(lastAutoGuardApplyTime) > 6.0 {
                     let sortedRms = guardQuietSamples.sorted()
                     let p40Floor = Double(sortedRms[Int(Double(sortedRms.count) * 0.40)])
                     let p90Noise = Double(sortedRms[Int(Double(sortedRms.count) * 0.90)])
                     let meanRumble = Double(guardRumbleSamples.reduce(0, +)) / Double(guardRumbleSamples.count)
-
-                    let targetGate = max(-48.0, min(-28.0, (max(p40Floor + 8.0, p90Noise + 3.0)).rounded()))
+                    let targetGate = max(-48.0, min(-28.0, max(p40Floor + 8.0, p90Noise + 3.0).rounded()))
                     let wantHpf150 = (meanRumble > -52.0 || p40Floor > -43.0)
                     let targetHpf = wantHpf150 ? 2 : 1
-
                     if abs(targetGate - rodeDsp.gateThresholdDb) >= 3.0 || targetHpf != rodeDsp.hpfMode {
                         lastAutoGuardApplyTime = now
-                        var next = rodeDsp
-                        next.gateEnabled = true
-                        next.gateThresholdDb = targetGate
-                        next.hpfMode = targetHpf
-                        if wantHpf150 && p40Floor > -41.0 {
-                            next.bigBottomEnabled = false
-                        }
-                        applyRodeSettingsNow(next, label: tr("Авто-адаптация: HPF \(next.hpfLabel), Gate \(Int(targetGate)) dB", "Auto-adapted: HPF \(next.hpfLabel), Gate \(Int(targetGate)) dB"))
+                        var next = rodeDsp; next.gateEnabled = true; next.gateThresholdDb = targetGate; next.hpfMode = targetHpf
+                        if wantHpf150 && p40Floor > -41.0 { next.bigBottomEnabled = false }
+                        if obsConnected { obsBridge.setRnnoiseEnabled(wantHpf150 && p40Floor > -42.0) }
+                        applyRodeSettingsNow(next, label: tr("Авто-адаптация: HPF \(next.hpfLabel), Gate \(Int(targetGate)) dB", "Auto-adapted"))
                     }
                 }
             }
         }
 
-        // Publish to SwiftUI
-        peakDb = curPeakDb
-        rmsDb = curRmsDb
-        momentaryLufs = momLufs
-        shortTermLufs = stLufs
-        integratedLufs = intLufs
-        dynamicsPlrDb = plr
-        noiseFloorDb = noiseFloorEstimate
-        liveRumbleDb = rumbleEstimate
-        dominantFreqHz = domHz
-        dominantNote = domNote
-        stereoCorrelation = stereoCorrelation * 0.8 + curCorr * 0.2
+        peakDb = curPeakDb; rmsDb = curRmsDb; momentaryLufs = momLufs; shortTermLufs = stLufs
+        integratedLufs = intLufs; dynamicsPlrDb = plr; noiseFloorDb = noiseFloorEstimate; liveRumbleDb = rumbleEstimate
+        dominantFreqHz = domHz; dominantNote = domNote; stereoCorrelation = stereoCorrelation * 0.8 + curCorr * 0.2
 
         if !isFrozen {
-            spectrumCurve = newCurve
-            spectrumPeaks = newPeaks
-            coloredWave = newWave
-            oscilloscope = newOsc
-            spectrogram = newSpec
-            lufsHistory = newLufsHist
-            stereoXY = newXY
+            spectrumCurve = newCurve; spectrumPeaks = newPeaks; coloredWave = newWave
+            oscilloscope = newOsc; spectrogram = newSpec; lufsHistory = newLufsHist; stereoXY = newXY
         }
+    }
+
+    // MARK: - Clap RT60 Room Reverb / Echo Test (Schroeder Backward Integration)
+    func startClapEchoTest() {
+        if isScanning { cancelScan(); return }
+        if sourceMode != .microphone { setSourceMode(.microphone) }
+        isScanning = true
+        scanMode = "clapEcho"
+        scanPhase = "waitClap"
+        scanCountdown = 6
+        scanReport = nil
+        showScanPopover = false
+
+        os_unfair_lock_lock(&ringLock)
+        clapTailSamples.removeAll()
+        isWaitingForClap = true
+        isCapturingClapTail = false
+        os_unfair_lock_unlock(&ringLock)
+
+        scanTimer?.invalidate()
+        var rem = 6
+        scanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] t in
+            guard let self = self else { t.invalidate(); return }
+            if self.isCapturingClapTail {
+                self.scanPhase = "captureTail"
+                return
+            }
+            rem -= 1
+            if rem > 0 {
+                self.scanCountdown = rem
+            } else {
+                t.invalidate()
+                self.cancelScan()
+                self.showToast(tr("Хлопок не услышан — хлопните громче перед микрофоном", "No clap detected — clap louder near mic"))
+            }
+        }
+    }
+
+    private func finishClapEchoTest() {
+        scanTimer?.invalidate(); scanTimer = nil
+        isScanning = false; scanPhase = ""; scanMode = ""
+
+        os_unfair_lock_lock(&ringLock)
+        let raw = clapTailSamples
+        clapTailSamples.removeAll()
+        os_unfair_lock_unlock(&ringLock)
+
+        guard raw.count >= 24000 else { return }
+        let sr = activeSampleRate
+
+        // 1. Estimate room noise energy from last 250ms of the 1.5s buffer
+        let tailLen = min(raw.count / 4, Int(sr * 0.25))
+        let tailStart = raw.count - tailLen
+        var noisePwr: Double = 0
+        for i in tailStart..<raw.count { noisePwr += Double(raw[i] * raw[i]) }
+        noisePwr /= Double(max(1, tailLen))
+
+        // 2. Schroeder backward energy integration in 5ms blocks (up to 1.2s after clap peak)
+        let blockSamples = max(1, Int(sr * 0.005))
+        let maxSamples = min(raw.count - tailLen, Int(sr * 1.2))
+        let numBlocks = maxSamples / blockSamples
+        guard numBlocks > 20 else { return }
+
+        var blockE = [Double](repeating: 0, count: numBlocks)
+        for b in 0..<numBlocks {
+            var s: Double = 0
+            let i0 = b * blockSamples
+            for k in i0..<(i0 + blockSamples) { s += Double(raw[k] * raw[k]) }
+            blockE[b] = max(0, (s / Double(blockSamples)) - noisePwr * 1.15)
+        }
+        var schroeder = [Double](repeating: 0, count: numBlocks)
+        var cum: Double = 0
+        for b in stride(from: numBlocks - 1, through: 0, by: -1) {
+            cum += blockE[b]
+            schroeder[b] = cum
+        }
+        let maxE = max(schroeder[0], 1e-12)
+        let decayDb = schroeder.map { 10.0 * log10(max($0 / maxE, 1e-9)) }
+
+        // 3. Measure T20 (-5 dB -> -25 dB) and extrapolate RT60 = T20 * 3
+        let idx5  = decayDb.firstIndex(where: { $0 <= -5.0 }) ?? 1
+        let idx25 = decayDb.firstIndex(where: { $0 <= -25.0 }) ?? (numBlocks - 1)
+        let t20 = max(0.04, Double(max(1, idx25 - idx5)) * 0.005)
+        let rt60 = max(0.14, min(1.80, t20 * 3.0))
+
+        var dsp = rodeDsp
+        let envLabel: String
+        let diag: String
+        if rt60 > 0.52 {
+            envLabel = tr("🏠 Гулкая комната / Эхо (RT60: \(String(format: "%.2f", rt60))с)", "🏠 Echoey Room (RT60: \(String(format: "%.2f", rt60))s)")
+            diag = tr("Сильные отражения стен! Ускорен Release гейта (125 ms), ослаблен компрессор (1.8:1), чтобы не вытягивать хвосты эха, включён HPF 150 Hz.",
+                      "Noticeable room reverb! Fast gate release (125ms), lighter 1.8:1 compressor, and 150 Hz HPF applied.")
+            dsp.hpfMode = 2
+            dsp.gateEnabled = true
+            dsp.gateReleaseMs = 125.0
+            dsp.gateHoldMs = 35.0
+            dsp.compEnabled = true
+            dsp.compThresholdDb = -20.0
+            dsp.compRatio = 1.8
+            dsp.compGainDb = 1.5
+            dsp.bigBottomEnabled = true
+            dsp.bigBottomDrivePct = 28.0
+            dsp.exciterMixPct = 45.0
+        } else if rt60 > 0.32 {
+            envLabel = tr("🛋 Жилая комната (RT60: \(String(format: "%.2f", rt60))с)", "🛋 Normal Room (RT60: \(String(format: "%.2f", rt60))s)")
+            diag = tr("Умеренная реверберация жилого помещения. Подобран сбалансированный компрессор 2.0:1 и чистый релиз гейта 170 ms.",
+                      "Moderate living-room reflections. Balanced 2.0:1 compressor and clean 170ms gate release.")
+            dsp.hpfMode = 1
+            dsp.gateEnabled = true
+            dsp.gateReleaseMs = 170.0
+            dsp.compEnabled = true
+            dsp.compThresholdDb = -23.0
+            dsp.compRatio = 2.0
+            dsp.compGainDb = 2.0
+            dsp.bigBottomDrivePct = 42.0
+        } else {
+            envLabel = tr("🎙 Сухая студийная акустика (RT60: \(String(format: "%.2f", rt60))с)", "🎙 Dry Studio Room (RT60: \(String(format: "%.2f", rt60))s)")
+            diag = tr("Отличное поглощение — эха почти нет! Можно смело использовать плотный компрессор и тёплый Big Bottom.",
+                      "Very dry studio acoustics! Safe for rich broadcast compression & warm Big Bottom.")
+            dsp.hpfMode = 1
+            dsp.gateReleaseMs = 230.0
+            dsp.compThresholdDb = -25.0
+            dsp.compRatio = 2.3
+            dsp.bigBottomEnabled = true
+            dsp.bigBottomDrivePct = 55.0
+        }
+
+        let applied = rodeConnected
+        if applied { applyRodeSettingsNow(dsp, label: "RT60 \(String(format: "%.2f", rt60))с") }
+
+        scanReport = AcousticScanReport(
+            modeTitle: tr("👏 Тест эха комнаты (RT60)", "👏 Clap Room Echo Test (RT60)"),
+            environmentLabel: envLabel, diagnosisDetail: diag,
+            noiseFloorDb: Double(noiseFloorDb), peakImpulseDb: Double(peakHoldDb), rumbleDb: Double(liveRumbleDb),
+            rt60Seconds: rt60, speechLufs: nil, peakSpeechDb: nil,
+            suggestedDsp: dsp, suggestedRnnoise: obsRnnoiseEnabled, appliedToHardware: applied
+        )
+        showScanPopover = true
     }
 
     // MARK: - Smart Noise Auto-Scanner (5s Pure Room Noise OR 10s Room + Voice)
     func startNoiseAutoScan(fullWithVoice: Bool) {
         if isScanning { cancelScan(); return }
+        if sourceMode != .microphone { setSourceMode(.microphone) }
         isScanning = true
         scanMode = fullWithVoice ? "full10s" : "noise5s"
-        scanReport = nil
-        showScanPopover = false
+        scanReport = nil; showScanPopover = false
         scanQuietRms.removeAll(); scanQuietPeaks.removeAll(); scanQuietRumble.removeAll()
         scanQuietMid.removeAll(); scanQuietHigh.removeAll()
         scanSpeechLufs.removeAll(); scanMud.removeAll(); scanPres.removeAll(); scanSib.removeAll()
         scanSpeechPeakMax = -60.0
-        scanStep = 0
-        scanPhase = "quiet"
-        scanCountdown = fullWithVoice ? 4 : 5
+        scanStep = 0; scanPhase = "quiet"; scanCountdown = fullWithVoice ? 4 : 5
 
         scanTimer?.invalidate()
         scanTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] t in
             guard let self = self else { t.invalidate(); return }
             self.scanStep += 1
             if self.scanMode == "noise5s" {
-                if self.scanStep < 5 {
-                    self.scanPhase = "quiet"; self.scanCountdown = 5 - self.scanStep
-                } else {
-                    t.invalidate(); self.finishAcousticScan(withVoice: false)
-                }
+                if self.scanStep < 5 { self.scanPhase = "quiet"; self.scanCountdown = 5 - self.scanStep }
+                else { t.invalidate(); self.finishAcousticScan(withVoice: false) }
             } else {
-                if self.scanStep < 4 {
-                    self.scanPhase = "quiet"; self.scanCountdown = 4 - self.scanStep
-                } else if self.scanStep < 10 {
-                    self.scanPhase = "speak"; self.scanCountdown = 10 - self.scanStep
-                } else {
-                    t.invalidate(); self.finishAcousticScan(withVoice: true)
-                }
+                if self.scanStep < 4 { self.scanPhase = "quiet"; self.scanCountdown = 4 - self.scanStep }
+                else if self.scanStep < 10 { self.scanPhase = "speak"; self.scanCountdown = 10 - self.scanStep }
+                else { t.invalidate(); self.finishAcousticScan(withVoice: true) }
             }
         }
     }
 
     func cancelScan() {
         scanTimer?.invalidate(); scanTimer = nil
+        os_unfair_lock_lock(&ringLock)
+        isWaitingForClap = false; isCapturingClapTail = false; clapTailSamples.removeAll()
+        os_unfair_lock_unlock(&ringLock)
         isScanning = false; scanPhase = ""; scanMode = ""
     }
 
@@ -1956,8 +2326,7 @@ final class AudioAnalyzerEngine: ObservableObject {
         func mean(_ a: [Float], _ fb: Double) -> Double { a.isEmpty ? fb : Double(a.reduce(0, +)) / Double(a.count) }
         func pct(_ a: [Float], _ p: Double, _ fb: Double) -> Double {
             guard !a.isEmpty else { return fb }
-            let s = a.sorted()
-            return Double(s[min(s.count - 1, max(0, Int(Double(s.count) * p)))])
+            let s = a.sorted(); return Double(s[min(s.count - 1, max(0, Int(Double(s.count) * p)))])
         }
 
         let floorDb   = pct(scanQuietRms, 0.50, Double(noiseFloorDb))
@@ -1965,141 +2334,83 @@ final class AudioAnalyzerEngine: ObservableObject {
         let rumbleDb  = mean(scanQuietRumble, Double(liveRumbleDb))
         let midNoise  = mean(scanQuietMid, -58.0)
         let highNoise = mean(scanQuietHigh, -62.0)
-        let impulseJump = peakImp - floorDb
 
-        // Build tailored hardware DSP preset from actual measured acoustics!
         var dsp = rodeDsp
-        var envLabel = ""
-        var diag = ""
-
-        let isHeavyConstruction = (rumbleDb > -50.0) || (floorDb > -41.0) || (peakImp > -28.0 && impulseJump > 12.0)
+        let envLabel: String; let diag: String; let wantRnnoise: Bool
+        let isHeavyConstruction = (rumbleDb > -50.0) || (floorDb > -41.0) || (peakImp > -28.0 && (peakImp - floorDb) > 12.0)
         let isModerateNoise     = (floorDb > -48.0) || (midNoise > -52.0) || (highNoise > -56.0)
 
         if isHeavyConstruction {
             envLabel = tr("🏗 Стройка / Сильный внешний шум", "🏗 Construction / Heavy Rumble")
-            diag = tr("Обнаружен низкий гул (\(Int(rumbleDb)) dB) и всплески шума до \(Int(peakImp)) dB. Включён HPF 150 Hz, жёсткий Noise Gate и отключён Big Bottom.",
-                      "Detected heavy rumble (\(Int(rumbleDb)) dB) & spikes to \(Int(peakImp)) dB. Enabled 150 Hz HPF, tight gate, disabled Big Bottom.")
-            dsp.hpfMode = 2
-            dsp.gateEnabled = true
+            diag = tr("Обнаружен низкий гул (\(Int(rumbleDb)) dB) и всплески до \(Int(peakImp)) dB. Включён HPF 150 Hz, жёсткий Gate, отключён Big Bottom и активирован OBS AI RNNoise.",
+                      "Heavy rumble (\(Int(rumbleDb)) dB) & spikes to \(Int(peakImp)) dB. Enabled 150Hz HPF, tight gate, OBS AI RNNoise.")
+            wantRnnoise = true
+            dsp.hpfMode = 2; dsp.gateEnabled = true
             dsp.gateThresholdDb = max(-42.0, min(-26.0, max(floorDb + 8.0, peakImp + 1.5).rounded()))
-            dsp.gateAttackMs = 15.0
-            dsp.gateHoldMs = 45.0
-            dsp.gateReleaseMs = 150.0
-            dsp.gateHysteresisDb = -7.0
-            dsp.bigBottomEnabled = false
-            dsp.bigBottomDrivePct = 20.0
-            dsp.compEnabled = true
-            dsp.compThresholdDb = -23.0
-            dsp.compRatio = 2.4
-            dsp.compGainDb = 2.0
-            dsp.exciterEnabled = true
-            dsp.exciterMixPct = 55.0
-            dsp.exciterTuneHz = 3500.0
+            dsp.gateAttackMs = 15.0; dsp.gateHoldMs = 45.0; dsp.gateReleaseMs = 150.0; dsp.gateHysteresisDb = -7.0
+            dsp.bigBottomEnabled = false; dsp.bigBottomDrivePct = 20.0
+            dsp.compEnabled = true; dsp.compThresholdDb = -23.0; dsp.compRatio = 2.4; dsp.compGainDb = 2.0
+            dsp.exciterEnabled = true; dsp.exciterMixPct = 55.0; dsp.exciterTuneHz = 3500.0
             if !withVoice { dsp.inputGainDb = min(dsp.inputGainDb, 40.0) }
         } else if isModerateNoise {
             envLabel = tr("🏢 Помещение с фоном / Эхом", "🏢 Moderate Room / HVAC Noise")
-            diag = tr("Фон комнаты \(Int(floorDb)) dB (гул \(Int(rumbleDb)) dB). Выставлен оптимальный HPF и быстрый релиз гейта, чтобы отсечь фон и хвосты эха.",
-                      "Room floor \(Int(floorDb)) dB. Applied optimal HPF & fast gate release to keep room noise out.")
-            dsp.hpfMode = rumbleDb > -55.0 ? 2 : 1
-            dsp.gateEnabled = true
+            diag = tr("Фон комнаты \(Int(floorDb)) dB. Подобран HPF и быстрый релиз гейта для чистого голоса.",
+                      "Room floor \(Int(floorDb)) dB. Applied optimal HPF & fast gate release.")
+            wantRnnoise = floorDb > -44.0
+            dsp.hpfMode = rumbleDb > -55.0 ? 2 : 1; dsp.gateEnabled = true
             dsp.gateThresholdDb = max(-45.0, min(-32.0, max(floorDb + 7.5, peakImp + 1.0).rounded()))
-            dsp.gateAttackMs = 20.0
-            dsp.gateHoldMs = 50.0
-            dsp.gateReleaseMs = 165.0
-            dsp.gateHysteresisDb = -8.0
-            dsp.bigBottomEnabled = true
-            dsp.bigBottomDrivePct = 32.0
-            dsp.bigBottomTuneHz = 95.0
-            dsp.compEnabled = true
-            dsp.compThresholdDb = -22.0
-            dsp.compRatio = 2.0
-            dsp.compGainDb = 1.5
-            dsp.exciterEnabled = true
-            dsp.exciterMixPct = 52.0
-            dsp.exciterTuneHz = 3500.0
+            dsp.gateAttackMs = 20.0; dsp.gateHoldMs = 50.0; dsp.gateReleaseMs = 165.0; dsp.gateHysteresisDb = -8.0
+            dsp.bigBottomEnabled = true; dsp.bigBottomDrivePct = 32.0; dsp.bigBottomTuneHz = 95.0
+            dsp.compEnabled = true; dsp.compThresholdDb = -22.0; dsp.compRatio = 2.0; dsp.compGainDb = 1.5
+            dsp.exciterEnabled = true; dsp.exciterMixPct = 52.0; dsp.exciterTuneHz = 3500.0
             if !withVoice { dsp.inputGainDb = max(39.0, min(42.0, dsp.inputGainDb)) }
         } else {
             envLabel = tr("🎙 Тихая студийная комната", "🎙 Quiet Studio Room")
-            diag = tr("Отличная тишина (\(Int(floorDb)) dB)! Выставлен мягкий HPF 75 Hz, бережный гейт и тёплая студийная обработка APHEX.",
-                      "Clean quiet room (\(Int(floorDb)) dB)! Set 75 Hz HPF, gentle gate & full warm APHEX studio chain.")
-            dsp.hpfMode = 1
-            dsp.gateEnabled = true
+            diag = tr("Отличная тишина (\(Int(floorDb)) dB)! Включён HPF 75 Hz, мягкий гейт, тёплый APHEX и выключен OBS RNNoise.",
+                      "Clean quiet room (\(Int(floorDb)) dB)! 75Hz HPF, gentle gate, warm APHEX, RNNoise OFF.")
+            wantRnnoise = false
+            dsp.hpfMode = 1; dsp.gateEnabled = true
             dsp.gateThresholdDb = max(-52.0, min(-42.0, (floorDb + 7.0).rounded()))
-            dsp.gateAttackMs = 25.0
-            dsp.gateHoldMs = 70.0
-            dsp.gateReleaseMs = 240.0
-            dsp.gateHysteresisDb = -9.0
-            dsp.bigBottomEnabled = true
-            dsp.bigBottomDrivePct = 55.0
-            dsp.bigBottomTuneHz = 88.0
-            dsp.compEnabled = true
-            dsp.compThresholdDb = -25.0
-            dsp.compRatio = 2.0
-            dsp.compGainDb = 2.0
-            dsp.exciterEnabled = true
-            dsp.exciterMixPct = 60.0
-            dsp.exciterTuneHz = 3500.0
+            dsp.gateAttackMs = 25.0; dsp.gateHoldMs = 70.0; dsp.gateReleaseMs = 240.0; dsp.gateHysteresisDb = -9.0
+            dsp.bigBottomEnabled = true; dsp.bigBottomDrivePct = 55.0; dsp.bigBottomTuneHz = 88.0
+            dsp.compEnabled = true; dsp.compThresholdDb = -25.0; dsp.compRatio = 2.0; dsp.compGainDb = 2.0
+            dsp.exciterEnabled = true; dsp.exciterMixPct = 60.0; dsp.exciterTuneHz = 3500.0
             if !withVoice { dsp.inputGainDb = max(41.0, min(44.0, dsp.inputGainDb)) }
         }
 
-        // If full voice calibration was run, also dial in exact Input Gain + Exciter/BigBottom to the user's voice!
-        var speechLufsOut: Double? = nil
-        var speechPeakOut: Double? = nil
+        var speechLufsOut: Double? = nil; var speechPeakOut: Double? = nil
         if withVoice && !scanSpeechLufs.isEmpty {
-            let avgLufs = mean(scanSpeechLufs, Double(shortTermLufs))
-            let pk = Double(scanSpeechPeakMax)
-            speechLufsOut = avgLufs
-            speechPeakOut = pk
+            let avgLufs = mean(scanSpeechLufs, Double(shortTermLufs)); let pk = Double(scanSpeechPeakMax)
+            speechLufsOut = avgLufs; speechPeakOut = pk
             let target = Double(loudnessTarget.lufs)
-
-            if pk > -2.5 {
-                dsp.inputGainDb = max(28.0, (dsp.inputGainDb - 4.0).rounded())
-            } else if avgLufs < target - 4.0 {
-                dsp.inputGainDb = min(50.0, (dsp.inputGainDb + min(5.0, (target - avgLufs) * 0.6)).rounded())
-            } else if avgLufs > target + 3.0 {
-                dsp.inputGainDb = max(30.0, (dsp.inputGainDb - min(4.0, (avgLufs - target) * 0.6)).rounded())
-            }
-
-            let mudDb = mean(scanMud, -42.0)
-            let presDb = mean(scanPres, -46.0)
-            let sibDb = mean(scanSib, -54.0)
-            if mudDb > presDb + 10.0 && !isHeavyConstruction {
-                dsp.bigBottomDrivePct = 25.0
-            }
-            if sibDb > presDb - 3.5 {
-                dsp.exciterMixPct = 30.0
-            }
+            if pk > -2.5 { dsp.inputGainDb = max(28.0, (dsp.inputGainDb - 4.0).rounded()) }
+            else if avgLufs < target - 4.0 { dsp.inputGainDb = min(50.0, (dsp.inputGainDb + min(5.0, (target - avgLufs) * 0.6)).rounded()) }
+            else if avgLufs > target + 3.0 { dsp.inputGainDb = max(30.0, (dsp.inputGainDb - min(4.0, (avgLufs - target) * 0.6)).rounded()) }
+            if mean(scanMud, -42.0) > mean(scanPres, -46.0) + 10.0 && !isHeavyConstruction { dsp.bigBottomDrivePct = 25.0 }
+            if mean(scanSib, -54.0) > mean(scanPres, -46.0) - 3.5 { dsp.exciterMixPct = 30.0 }
         }
 
-        // Apply straight into RØDE NT1 5th Gen hardware immediately if connected!
         let willApply = rodeConnected
         if willApply {
             activeProfileId = ""
+            if obsConnected { obsBridge.setRnnoiseEnabled(wantRnnoise) }
             applyRodeSettingsNow(dsp, label: envLabel)
         }
 
         scanReport = AcousticScanReport(
             modeTitle: withVoice ? tr("🎯 Полная калибровка (Шум + Голос)", "🎯 Full Room + Voice Scan") : tr("⚡ Авто-подбор по шуму (5 сек)", "⚡ 5s Room Noise Auto-Scan"),
-            environmentLabel: envLabel,
-            diagnosisDetail: diag,
-            noiseFloorDb: floorDb,
-            peakImpulseDb: peakImp,
-            rumbleDb: rumbleDb,
-            speechLufs: speechLufsOut,
-            peakSpeechDb: speechPeakOut,
-            suggestedDsp: dsp,
-            appliedToHardware: willApply
+            environmentLabel: envLabel, diagnosisDetail: diag,
+            noiseFloorDb: floorDb, peakImpulseDb: peakImp, rumbleDb: rumbleDb, rt60Seconds: nil,
+            speechLufs: speechLufsOut, peakSpeechDb: speechPeakOut,
+            suggestedDsp: dsp, suggestedRnnoise: wantRnnoise, appliedToHardware: willApply
         )
         showScanPopover = true
     }
 
     // Demo Visualization for --screenshot
     private func populateDemoVisualization() {
-        isRunning = true
-        rodeConnected = true
-        activeDeviceName = "RØDE NT1 5th Gen"
-        activeProfileId = "builtin_construction"
-        activeMicPresetId = "mic_radio"
+        isRunning = true; rodeConnected = true; obsConnected = true; obsRnnoiseEnabled = true; isGateOpen = true
+        activeDeviceName = "RØDE NT1 5th Gen"; activeProfileId = "builtin_construction"; activeMicPresetId = "mic_radio"
         rodeDsp = RoomAudioProfile.builtInProfiles[0].dsp
         liveNoiseStatus = "⚠ Шум/Стройка"
         peakDb = -6.8; peakHoldDb = -5.2; rmsDb = -15.4
@@ -2109,13 +2420,8 @@ final class AudioAnalyzerEngine: ObservableObject {
 
         for i in 0..<Self.waveSlicesCount {
             let t = Float(i) * 0.13
-            let env = min(0.95, max(0.08, 0.25 + 0.62 * abs(sin(t * 0.42)) * (0.6 + 0.4 * cos(t * 1.1))))
-            coloredWave[i] = ColoredWaveSlice(
-                amplitude: env,
-                lowWeight: 0.35 + 0.45 * abs(sin(t * 0.27)),
-                midWeight: 0.55 + 0.35 * abs(cos(t * 0.51)),
-                highWeight: 0.15 + 0.55 * pow(max(0, sin(t * 0.83)), 3)
-            )
+            let env = min(0.95, max(0.06, 0.25 + 0.62 * abs(sin(t * 0.42)) * (0.6 + 0.4 * cos(t * 1.1))))
+            coloredWave[i] = ColoredWaveSlice(amplitude: env, lowWeight: 0.35 + 0.45 * abs(sin(t * 0.27)), midWeight: 0.55 + 0.35 * abs(cos(t * 0.51)), highWeight: 0.15 + 0.55 * pow(max(0, sin(t * 0.83)), 3))
         }
         for i in 0..<Self.oscPointsCount {
             let p = Float(i) / Float(Self.oscPointsCount) * 4.0 * .pi
@@ -2129,224 +2435,242 @@ final class AudioAnalyzerEngine: ObservableObject {
             let mod = 0.42 + 0.58 * abs(sin(Float(c) * 0.15))
             for r in 0..<Self.spectrogramRows {
                 let y = Float(r) / Float(Self.spectrogramRows)
-                let f1 = exp(-pow((y - 0.24) / 0.15, 2)) * 0.92 * mod
-                let f2 = exp(-pow((y - 0.56) / 0.16, 2)) * 0.72 * mod
-                let f3 = exp(-pow((y - 0.80) / 0.10, 2)) * 0.38 * mod
-                spectrogram[c][r] = min(1.0, max(0.02, f1 + f2 + f3))
+                spectrogram[c][r] = min(1.0, max(0.02, exp(-pow((y - 0.24) / 0.15, 2)) * 0.92 * mod + exp(-pow((y - 0.56) / 0.16, 2)) * 0.72 * mod + exp(-pow((y - 0.80) / 0.10, 2)) * 0.38 * mod))
             }
         }
-        for i in 0..<Self.lufsHistoryCount {
-            let t = Float(i) * 0.16
-            lufsHistory[i] = -16.5 + sin(t) * 3.2 + cos(t * 2.3) * 1.4
-        }
-        for i in 0..<Self.stereoPointsCount {
-            let a = Float(i) * 0.25
-            stereoXY[i] = (sin(a * 1.7) * 0.22, cos(a) * 0.72)
-        }
+        for i in 0..<Self.lufsHistoryCount { let t = Float(i) * 0.16; lufsHistory[i] = -16.5 + sin(t) * 3.2 + cos(t * 2.3) * 1.4 }
+        for i in 0..<Self.stereoPointsCount { let a = Float(i) * 0.25; stereoXY[i] = (sin(a * 1.7) * 0.22, cos(a) * 0.72) }
     }
 }
 
-// MARK: - Standard Titled macOS Studio UI (Meters + Room Presets + Live RØDE NT1 DSP Drawer)
+// MARK: - Standard Titled macOS Studio UI v2.5
 struct AudioMetersView: View {
     @ObservedObject var eng: AudioAnalyzerEngine
 
     var body: some View {
         VStack(spacing: 0) {
-            // ROW 1: Main Studio Controls Toolbar (Clean, No Frameless Overlap!)
-            HStack(spacing: 8) {
+            // ROW 1: Main Controls (Logo, Source Mic/System, Device, Bar/Quad, Voice Check, Scanners, Mute, RØDE DSP)
+            HStack(spacing: 6) {
                 if let logoPath = Bundle.main.path(forResource: "mo_audio_logo", ofType: "png") ?? Bundle.main.path(forResource: "mo_logo", ofType: "png"),
                    let nsImg = NSImage(contentsOfFile: logoPath) {
-                    Image(nsImage: nsImg)
-                        .resizable().aspectRatio(contentMode: .fit)
-                        .frame(width: 24, height: 24)
+                    Image(nsImage: nsImg).resizable().aspectRatio(contentMode: .fit).frame(width: 24, height: 24)
                 }
 
-                // Input Device Picker
-                Menu {
-                    ForEach(eng.devices) { dev in
-                        Button((dev.uid == eng.selectedDeviceUID ? "✅ " : "") + "\(dev.name) • \(Int(dev.sampleRate/1000))kHz") {
-                            eng.selectDevice(uid: dev.uid)
+                // Mic vs System Audio Switcher (MiniMeters!)
+                HStack(spacing: 1.5) {
+                    iconLayoutPill("mic.fill", eng.tr("Мик", "Mic"), active: eng.sourceMode == .microphone) { eng.setSourceMode(.microphone) }
+                    iconLayoutPill("speaker.wave.2.fill", eng.tr("Сист.", "Sys"), active: eng.sourceMode == .systemAudio) { eng.setSourceMode(.systemAudio) }
+                }
+
+                // Input Device Menu (when in Mic mode)
+                if eng.sourceMode == .microphone {
+                    Menu {
+                        ForEach(eng.devices) { dev in
+                            Button((dev.uid == eng.selectedDeviceUID ? "✅ " : "") + "\(dev.name) • \(Int(dev.sampleRate/1000))kHz") {
+                                eng.selectDevice(uid: dev.uid)
+                            }
+                        }
+                        Divider()
+                        Button(eng.tr("🔄 Обновить входы", "🔄 Refresh Inputs")) { eng.refreshDevices(); eng.restartEngine() }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Circle().fill(eng.isGlobalMuted ? Color.red : (eng.isRunning ? Color.green : Color.orange)).frame(width: 6, height: 6)
+                            Text(eng.activeDeviceName).font(.system(size: 10.5, weight: .semibold)).lineLimit(1)
                         }
                     }
-                    Divider()
-                    Button(eng.tr("🔄 Обновить входы", "🔄 Refresh Inputs")) {
-                        eng.refreshDevices(); eng.restartEngine()
-                    }
-                } label: {
-                    HStack(spacing: 5) {
-                        Circle().fill(eng.isRunning ? Color.green : Color.red).frame(width: 6.5, height: 6.5)
-                        Text(eng.activeDeviceName).font(.system(size: 11, weight: .semibold)).lineLimit(1)
-                        Text("\(Int(eng.activeSampleRate/1000))k").font(.system(size: 9.5, weight: .bold, design: .monospaced)).foregroundColor(.secondary)
-                    }
+                    .menuStyle(.borderedButton).controlSize(.small).frame(maxWidth: 162)
                 }
-                .menuStyle(.borderedButton).controlSize(.small).frame(maxWidth: 200)
 
-                // Layout Toggle: BAR vs QUAD
-                HStack(spacing: 2) {
+                // BAR / QUAD Switcher
+                HStack(spacing: 1.5) {
                     layoutPill("BAR",  active: eng.layoutMode == .bar)  { eng.setLayoutMode(.bar) }
                     layoutPill("QUAD", active: eng.layoutMode == .quad) { eng.setLayoutMode(.quad) }
                 }
 
-                // Fast 5s Room Noise Auto-Scan -> Direct Apply to RØDE NT1!
+                // 5s Room Noise Auto-Scan
                 Button(action: { eng.startNoiseAutoScan(fullWithVoice: false) }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Image(systemName: eng.isScanning && eng.scanMode == "noise5s" ? "waveform.circle.fill" : "bolt.fill")
-                        if eng.isScanning && eng.scanMode == "noise5s" {
-                            Text(eng.tr("Молчите \(eng.scanCountdown)с...", "Silence \(eng.scanCountdown)s..."))
-                        } else {
-                            Text(eng.tr("Авто-шум 5с", "Auto-Noise 5s"))
-                        }
+                        Text(eng.isScanning && eng.scanMode == "noise5s" ? eng.tr("Тихо \(eng.scanCountdown)с", "Quiet \(eng.scanCountdown)s") : eng.tr("Шум 5с", "Noise 5s"))
                     }
-                    .font(.system(size: 10.5, weight: .bold))
-                    .padding(.horizontal, 9).padding(.vertical, 4.5)
-                    .background(eng.isScanning && eng.scanMode == "noise5s" ? Color.orange : Color.orange.opacity(0.22))
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 4)
+                    .background(eng.isScanning && eng.scanMode == "noise5s" ? Color.orange : Color.orange.opacity(0.20))
                     .foregroundColor(eng.isScanning && eng.scanMode == "noise5s" ? .white : .orange)
                     .cornerRadius(5)
                 }
                 .buttonStyle(.plain)
-                .help(eng.tr("Замерит шум комнаты/стройки за 5 сек и сразу настроит RØDE NT1", "Measure 5s room/construction noise and auto-configure RØDE NT1"))
+                .help(eng.tr("Замерить шум комнаты/стройки за 5с и настроить RØDE + RNNoise", "5s Room/Construction noise auto-setup"))
 
-                // Full 10s Room + Voice Calibrator
+                // 10s Voice + Noise Calibration
                 Button(action: { eng.startNoiseAutoScan(fullWithVoice: true) }) {
-                    HStack(spacing: 4) {
+                    HStack(spacing: 3) {
                         Image(systemName: eng.isScanning && eng.scanMode == "full10s" ? "waveform.circle.fill" : "target")
                         if eng.isScanning && eng.scanMode == "full10s" {
-                            Text(eng.scanPhase == "quiet"
-                                 ? eng.tr("Тишина \(eng.scanCountdown)с", "Quiet \(eng.scanCountdown)s")
-                                 : eng.tr("Говорите \(eng.scanCountdown)с", "Speak \(eng.scanCountdown)s"))
+                            Text(eng.scanPhase == "quiet" ? eng.tr("Тихо \(eng.scanCountdown)с", "Quiet \(eng.scanCountdown)s") : eng.tr("Речь \(eng.scanCountdown)с", "Speak \(eng.scanCountdown)s"))
                         } else {
-                            Text(eng.tr("Голос+Шум 10с", "Voice+Room 10s"))
+                            Text(eng.tr("Голос 10с", "Voice 10s"))
                         }
                     }
-                    .font(.system(size: 10.5, weight: .bold))
-                    .padding(.horizontal, 8).padding(.vertical, 4.5)
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 4)
                     .background(eng.isScanning && eng.scanMode == "full10s" ? (eng.scanPhase == "quiet" ? Color.orange : Color.red) : eng.theme.primary.opacity(0.18))
                     .foregroundColor(eng.isScanning && eng.scanMode == "full10s" ? .white : eng.theme.primary)
                     .cornerRadius(5)
                 }
                 .buttonStyle(.plain)
-                .popover(isPresented: $eng.showScanPopover, arrowEdge: .bottom) {
-                    scanResultPopoverView
-                }
+                .popover(isPresented: $eng.showScanPopover, arrowEdge: .bottom) { scanResultPopoverView }
 
-                // 10s WAV Capture + Freeze
-                Button(action: { eng.saveLast10SecondsClip() }) {
+                // Clap RT60 Room Echo Test!
+                Button(action: { eng.startClapEchoTest() }) {
                     HStack(spacing: 3) {
-                        Image(systemName: "waveform.badge.plus")
-                        Text("10s WAV")
+                        Image(systemName: "hands.clap.fill")
+                        if eng.isScanning && eng.scanMode == "clapEcho" {
+                            Text(eng.scanPhase == "captureTail" ? eng.tr("Анализ...", "Analyzing...") : eng.tr("Хлопок! \(eng.scanCountdown)с", "Clap! \(eng.scanCountdown)s"))
+                        } else {
+                            Text(eng.tr("Эхо", "Echo"))
+                        }
                     }
-                    .font(.system(size: 9.5, weight: .bold, design: .monospaced))
-                    .padding(.horizontal, 7).padding(.vertical, 4.5)
-                    .background(Color.white.opacity(0.08)).foregroundColor(.primary.opacity(0.9)).cornerRadius(5)
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 4)
+                    .background(eng.isScanning && eng.scanMode == "clapEcho" ? Color.teal : Color.teal.opacity(0.18))
+                    .foregroundColor(eng.isScanning && eng.scanMode == "clapEcho" ? .white : .teal)
+                    .cornerRadius(5)
                 }
                 .buttonStyle(.plain)
+                .help(eng.tr("Хлопок в ладоши → замер времени эха комнаты (RT60) и автонастройка релиза/компрессора", "Clap RT60 room echo measurement"))
+
+                // Instant 5s Voice Check (Record 5s -> Instant Headphone Playback!)
+                Button(action: { eng.toggleVoiceCheck() }) {
+                    HStack(spacing: 3) {
+                        Image(systemName: eng.voiceCheckPhase == "recording" ? "record.circle" : (eng.voiceCheckPhase == "playing" ? "speaker.wave.2.fill" : "headphones"))
+                        if eng.voiceCheckPhase == "recording" {
+                            Text(eng.tr("Запись \(eng.voiceCheckCountdown)с", "Rec \(eng.voiceCheckCountdown)s"))
+                        } else if eng.voiceCheckPhase == "playing" {
+                            Text(eng.tr("Слушаем \(eng.voiceCheckCountdown)с", "Play \(eng.voiceCheckCountdown)s"))
+                        } else {
+                            Text(eng.tr("Тест 5с", "Check 5s"))
+                        }
+                    }
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 4)
+                    .background(eng.voiceCheckPhase == "recording" ? Color.red : (eng.voiceCheckPhase == "playing" ? Color.green : Color.white.opacity(0.08)))
+                    .foregroundColor(eng.voiceCheckPhase.isEmpty ? .primary.opacity(0.9) : .white)
+                    .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+                .help(eng.tr("Запишет 5 секунд твоего голоса и сразу проиграет в наушники для проверки пресета", "Record 5s voice check and instantly play back in headphones"))
+
+                // 10s WAV + Freeze
+                Button(action: { eng.saveLast10SecondsClip() }) {
+                    Image(systemName: "waveform.badge.plus").font(.system(size: 10.5, weight: .bold))
+                        .padding(.horizontal, 6).padding(.vertical, 4)
+                        .background(Color.white.opacity(0.08)).foregroundColor(.primary.opacity(0.85)).cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+                .help(eng.tr("Сохранить последние 10с в WAV (Captures/)", "Save last 10s audio to WAV"))
 
                 Button(action: { eng.toggleFreeze() }) {
-                    Image(systemName: "snowflake")
-                        .font(.system(size: 10.5, weight: .bold))
-                        .padding(.horizontal, 6.5).padding(.vertical, 4.5)
+                    Image(systemName: "snowflake").font(.system(size: 10.5, weight: .bold))
+                        .padding(.horizontal, 6).padding(.vertical, 4)
                         .background(eng.isFrozen ? Color.cyan : Color.white.opacity(0.08))
                         .foregroundColor(eng.isFrozen ? .black : .secondary).cornerRadius(5)
                 }
                 .buttonStyle(.plain)
-                .help(eng.tr("Заморозить спектр", "Freeze spectrum"))
 
-                Spacer()
+                Spacer(minLength: 4)
 
-                if !eng.toastMessage.isEmpty {
-                    Text(eng.toastMessage)
-                        .font(.system(size: 10, weight: .bold))
-                        .foregroundColor(.green)
-                        .lineLimit(1)
+                // Global Hardware Mute Button (⌘⇧M)
+                Button(action: { eng.toggleGlobalMute() }) {
+                    HStack(spacing: 3.5) {
+                        Image(systemName: eng.isGlobalMuted ? "mic.slash.fill" : "mic.fill")
+                        Text(eng.isGlobalMuted ? "MUTED" : "⌘⇧M")
+                    }
+                    .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
+                    .padding(.horizontal, 7).padding(.vertical, 4)
+                    .background(eng.isGlobalMuted ? Color.red : Color.white.opacity(0.08))
+                    .foregroundColor(eng.isGlobalMuted ? .white : .secondary)
+                    .cornerRadius(5)
                 }
+                .buttonStyle(.plain)
+                .help(eng.tr("Аппаратный Mute микрофона RØDE + OBS из любого приложения (⌘⇧M)", "Global Hardware Mute RØDE + OBS (⌘⇧M)"))
 
                 // RØDE Hardware DSP Drawer Toggle
                 Button(action: { eng.toggleRodeDrawer() }) {
-                    HStack(spacing: 4.5) {
+                    HStack(spacing: 4) {
                         Circle().fill(eng.rodeConnected ? Color.green : Color.gray).frame(width: 6, height: 6)
-                        Image(systemName: "dial.medium.fill")
                         Text("RØDE DSP")
                     }
-                    .font(.system(size: 10.5, weight: .bold))
-                    .padding(.horizontal, 8.5).padding(.vertical, 4.5)
+                    .font(.system(size: 10, weight: .bold))
+                    .padding(.horizontal, 7.5).padding(.vertical, 4)
                     .background(eng.showRodeDrawer ? Color.green.opacity(0.24) : Color.white.opacity(0.08))
                     .foregroundColor(eng.showRodeDrawer ? .green : .primary.opacity(0.85))
                     .cornerRadius(5)
                 }
                 .buttonStyle(.plain)
-                .help(eng.tr("Показать/скрыть прямое управление RØDE NT1 5th Gen по USB", "Toggle direct RØDE NT1 5th Gen hardware DSP controls"))
 
-                // Settings Menu
+                // Pro Settings Menu
                 Menu {
                     Section(eng.tr("Цель громкости (Youlean)", "Loudness Target")) {
                         ForEach(LoudnessTarget.allCases, id: \.self) { lt in
-                            Button((eng.loudnessTarget == lt ? "✅ " : "") + lt.rawValue) {
-                                eng.loudnessTarget = lt; eng.scheduleSaveConfig()
-                            }
+                            Button((eng.loudnessTarget == lt ? "✅ " : "") + lt.rawValue) { eng.loudnessTarget = lt; eng.scheduleSaveConfig() }
                         }
                     }
                     Section(eng.tr("Наклон спектра", "Spectrum Tilt")) {
-                        Button((eng.spectrumTilt == 0.0 ? "✅ " : "") + "0 dB/oct (Flat)")          { eng.spectrumTilt = 0.0; eng.scheduleSaveConfig() }
-                        Button((eng.spectrumTilt == 3.0 ? "✅ " : "") + "+3.0 dB/oct (TDR Prism)")  { eng.spectrumTilt = 3.0; eng.scheduleSaveConfig() }
-                        Button((eng.spectrumTilt == 4.5 ? "✅ " : "") + "+4.5 dB/oct (FabFilter)")  { eng.spectrumTilt = 4.5; eng.scheduleSaveConfig() }
+                        Button((eng.spectrumTilt == 0.0 ? "✅ " : "") + "0 dB/oct (Flat)")         { eng.spectrumTilt = 0.0; eng.scheduleSaveConfig() }
+                        Button((eng.spectrumTilt == 3.0 ? "✅ " : "") + "+3.0 dB/oct (TDR Prism)") { eng.spectrumTilt = 3.0; eng.scheduleSaveConfig() }
+                        Button((eng.spectrumTilt == 4.5 ? "✅ " : "") + "+4.5 dB/oct (FabFilter)") { eng.spectrumTilt = 4.5; eng.scheduleSaveConfig() }
                     }
-                    Section(eng.tr("Оверлеи спектра", "Spectrum Overlays")) {
-                        Button((eng.showTargetCurve ? "✅ " : "") + eng.tr("Эталонная кривая голоса", "Vocal Target Curve")) {
-                            eng.showTargetCurve.toggle(); eng.scheduleSaveConfig()
-                        }
-                        Button((eng.showVocalZones ? "✅ " : "") + eng.tr("Зоны частот (HPF / Гул / С-Ш)", "Vocal Freq Zones")) {
-                            eng.showVocalZones.toggle(); eng.scheduleSaveConfig()
-                        }
+                    Section(eng.tr("Оверлеи спектра", "Overlays")) {
+                        Button((eng.showTargetCurve ? "✅ " : "") + eng.tr("Эталонная кривая голоса", "Vocal Target Curve")) { eng.showTargetCurve.toggle(); eng.scheduleSaveConfig() }
+                        Button((eng.showVocalZones ? "✅ " : "") + eng.tr("Зоны частот (HPF / Гул / С-Ш)", "Vocal Freq Zones")) { eng.showVocalZones.toggle(); eng.scheduleSaveConfig() }
                     }
                     Section(eng.tr("Цветовая тема", "Color Theme")) {
                         ForEach(MeterTheme.allCases, id: \.self) { t in
-                            Button((eng.theme == t ? "✅ " : "") + t.rawValue) {
-                                eng.theme = t; eng.scheduleSaveConfig()
-                            }
+                            Button((eng.theme == t ? "✅ " : "") + t.rawValue) { eng.theme = t; eng.scheduleSaveConfig() }
                         }
                     }
                     if eng.layoutMode == .bar {
                         Section(eng.tr("Модули в режиме BAR", "Bar Modules")) {
-                            Button((eng.showWaveform ? "✅ " : "") + "Multi-Band Waveform")  { eng.showWaveform.toggle(); eng.scheduleSaveConfig() }
-                            Button((eng.showOscilloscope ? "✅ " : "") + "Oscilloscope")     { eng.showOscilloscope.toggle(); eng.scheduleSaveConfig() }
-                            Button((eng.showSpectrum ? "✅ " : "") + "FabFilter Spectrum")   { eng.showSpectrum.toggle(); eng.scheduleSaveConfig() }
-                            Button((eng.showSpectrogram ? "✅ " : "") + "Mel Spectrogram")   { eng.showSpectrogram.toggle(); eng.scheduleSaveConfig() }
-                            Button((eng.showStereo ? "✅ " : "") + "Stereometer")            { eng.showStereo.toggle(); eng.scheduleSaveConfig() }
-                            Button((eng.showLoudness ? "✅ " : "") + "Youlean Loudness")     { eng.showLoudness.toggle(); eng.scheduleSaveConfig() }
+                            Button((eng.showWaveform ? "✅ " : "") + "Multi-Band Waveform") { eng.showWaveform.toggle(); eng.scheduleSaveConfig() }
+                            Button((eng.showOscilloscope ? "✅ " : "") + "Oscilloscope")    { eng.showOscilloscope.toggle(); eng.scheduleSaveConfig() }
+                            Button((eng.showSpectrum ? "✅ " : "") + "FabFilter Spectrum")  { eng.showSpectrum.toggle(); eng.scheduleSaveConfig() }
+                            Button((eng.showSpectrogram ? "✅ " : "") + "Mel Spectrogram")  { eng.showSpectrogram.toggle(); eng.scheduleSaveConfig() }
+                            Button((eng.showStereo ? "✅ " : "") + "Stereometer")           { eng.showStereo.toggle(); eng.scheduleSaveConfig() }
+                            Button((eng.showLoudness ? "✅ " : "") + "Youlean Loudness")    { eng.showLoudness.toggle(); eng.scheduleSaveConfig() }
                         }
                     }
                     Divider()
+                    Button((LaunchAgentManager.isEnabled ? "✅ " : "") + eng.tr("🚀 Запускать при входе в macOS", "🚀 Launch at Login")) {
+                        LaunchAgentManager.setEnabled(!LaunchAgentManager.isEnabled)
+                        eng.showToast(LaunchAgentManager.isEnabled ? eng.tr("🚀 Автозапуск включён", "🚀 Launch at Login ON") : eng.tr("Автозапуск выключен", "Launch at Login OFF"))
+                    }
                     Button(eng.tr("🎚 Открыть RØDE Central", "🎚 Open RØDE Central")) {
                         NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/RODE Central.app"))
                     }
                 } label: {
                     Image(systemName: "slider.horizontal.3").font(.system(size: 11)).foregroundColor(eng.theme.primary)
                 }
-                .menuStyle(.borderedButton).controlSize(.small).frame(width: 32)
+                .menuStyle(.borderedButton).controlSize(.small).frame(width: 30)
 
-                // Always on Top Toggle (works over Full-Screen too!)
+                // Always on Top
                 Button(action: { eng.setAlwaysOnTop(!eng.alwaysOnTop) }) {
-                    Image(systemName: eng.alwaysOnTop ? "pin.fill" : "pin")
-                        .font(.system(size: 10.5))
-                        .padding(.horizontal, 6.5).padding(.vertical, 4.5)
+                    Image(systemName: eng.alwaysOnTop ? "pin.fill" : "pin").font(.system(size: 10))
+                        .padding(.horizontal, 6).padding(.vertical, 4)
                         .background(eng.alwaysOnTop ? Color.indigo : Color.white.opacity(0.08))
                         .foregroundColor(.white).cornerRadius(5)
                 }
                 .buttonStyle(.plain)
-                .help(eng.tr("Поверх всех окон (включая Full-Screen)", "Pin always on top (Full-Screen overlay)"))
             }
-            .padding(.horizontal, 10).padding(.vertical, 7)
+            .padding(.horizontal, 9).padding(.vertical, 6.5)
             .background(Color.black.opacity(0.36))
 
             hairlineH
 
-            // ROW 2: Multi-Room Profiles & Live Noise-Adaptive Preset Strip!
+            // ROW 2: Room Profiles + OBS AI RNNoise Turbo Button + Adaptive Guard + Toast
             HStack(spacing: 6) {
-                // Live Room Noise Sensor Badge
-                HStack(spacing: 5) {
-                    Circle()
-                        .fill(eng.noiseFloorDb > -41 ? Color.red : (eng.noiseFloorDb > -48 ? Color.orange : Color.green))
-                        .frame(width: 6.5, height: 6.5)
+                HStack(spacing: 4.5) {
+                    Circle().fill(eng.noiseFloorDb > -41 ? Color.red : (eng.noiseFloorDb > -48 ? Color.orange : Color.green)).frame(width: 6, height: 6)
                     Text(String(format: "%@ %.0fdB", eng.liveNoiseStatus, eng.noiseFloorDb))
                         .font(.system(size: 9.5, weight: .bold, design: .monospaced))
                         .foregroundColor(eng.noiseFloorDb > -41 ? .orange : .secondary)
@@ -2360,7 +2684,7 @@ struct AudioMetersView: View {
                             let isActive = eng.activeProfileId == prof.id
                             HStack(spacing: 3) {
                                 Button(action: { eng.applyRoomProfile(prof) }) {
-                                    HStack(spacing: 4) {
+                                    HStack(spacing: 3.5) {
                                         Image(systemName: prof.icon).font(.system(size: 9.5))
                                         Text(prof.name).font(.system(size: 10, weight: isActive ? .bold : .semibold))
                                     }
@@ -2375,35 +2699,22 @@ struct AudioMetersView: View {
 
                                 if !prof.isBuiltIn {
                                     Button(action: { eng.deleteCustomRoom(prof.id) }) {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.system(size: 9.5))
-                                            .foregroundColor(.secondary.opacity(0.7))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help(eng.tr("Удалить комнату", "Delete room"))
+                                        Image(systemName: "xmark.circle.fill").font(.system(size: 9.5)).foregroundColor(.secondary.opacity(0.7))
+                                    }.buttonStyle(.plain)
                                 }
                             }
                         }
 
-                        // + Save Current Room Profile
                         Button(action: { eng.showSaveRoomPopover.toggle() }) {
-                            HStack(spacing: 3) {
-                                Image(systemName: "plus")
-                                Text(eng.tr("Комната", "Room"))
-                            }
-                            .font(.system(size: 10, weight: .semibold))
-                            .padding(.horizontal, 7).padding(.vertical, 3.5)
-                            .background(Color.white.opacity(0.06))
-                            .foregroundColor(.secondary)
-                            .cornerRadius(5)
+                            HStack(spacing: 2.5) { Image(systemName: "plus"); Text(eng.tr("Комната", "Room")) }
+                                .font(.system(size: 10, weight: .semibold))
+                                .padding(.horizontal, 7).padding(.vertical, 3.5)
+                                .background(Color.white.opacity(0.06)).foregroundColor(.secondary).cornerRadius(5)
                         }
                         .buttonStyle(.plain)
                         .popover(isPresented: $eng.showSaveRoomPopover, arrowEdge: .bottom) {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text(eng.tr("Сохранить текущую комнату", "Save Current Room Profile"))
-                                    .font(.system(size: 12, weight: .bold))
-                                Text(eng.tr("Сохранит Gain, HPF, Gate, Compressor и APHEX для быстрого переключения.", "Saves Gain, HPF, Gate, Compressor & APHEX for 1-click recall."))
-                                    .font(.system(size: 10)).foregroundColor(.secondary)
+                                Text(eng.tr("Сохранить текущую комнату", "Save Current Room Profile")).font(.system(size: 12, weight: .bold))
                                 TextField(eng.tr("Напр.: Кабинет (стройка), Спальня...", "e.g. Office, Bedroom..."), text: $eng.newRoomName)
                                     .textFieldStyle(.roundedBorder).frame(width: 230)
                                 HStack {
@@ -2413,25 +2724,42 @@ struct AudioMetersView: View {
                                         .buttonStyle(.borderedProminent).controlSize(.small)
                                         .disabled(eng.newRoomName.trimmingCharacters(in: .whitespaces).isEmpty)
                                 }
-                            }
-                            .padding(12)
+                            }.padding(12)
                         }
                     }
                 }
 
-                // Undo Last Hardware Change
-                if eng.previousRodeDsp != nil {
-                    Button(action: { eng.undoLastRodeChange() }) {
-                        Image(systemName: "arrow.uturn.backward")
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 6).padding(.vertical, 3.5)
-                            .background(Color.white.opacity(0.08)).foregroundColor(.orange).cornerRadius(5)
-                    }
-                    .buttonStyle(.plain)
-                    .help(eng.tr("Вернуть предыдущие настройки RØDE NT1", "Undo last RØDE NT1 DSP change"))
+                if !eng.toastMessage.isEmpty {
+                    Text(eng.toastMessage).font(.system(size: 9.5, weight: .bold)).foregroundColor(.green).lineLimit(1)
                 }
 
-                // Live Auto-Adaptive Noise Guard Toggle
+                if eng.previousRodeDsp != nil {
+                    Button(action: { eng.undoLastRodeChange() }) {
+                        Image(systemName: "arrow.uturn.backward").font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 6).padding(.vertical, 3.5)
+                            .background(Color.white.opacity(0.08)).foregroundColor(.orange).cornerRadius(5)
+                    }.buttonStyle(.plain).help(eng.tr("Откатить последнее изменение RØDE", "Undo last RØDE DSP change"))
+                }
+
+                // OBS AI RNNoise Turbo Button ("Перфоратор" Killer!)
+                Button(action: { eng.toggleObsRnnoise() }) {
+                    HStack(spacing: 3.5) {
+                        Image(systemName: "waveform.and.magnifyingglass")
+                        Text(eng.obsRnnoiseEnabled ? "RNNoise ON" : "RNNoise")
+                    }
+                    .font(.system(size: 9.5, weight: .bold))
+                    .padding(.horizontal, 7).padding(.vertical, 3.5)
+                    .background(eng.obsRnnoiseEnabled ? Color.orange.opacity(0.30) : Color.white.opacity(0.06))
+                    .foregroundColor(eng.obsRnnoiseEnabled ? .orange : (eng.obsConnected ? .secondary : .secondary.opacity(0.45)))
+                    .overlay(RoundedRectangle(cornerRadius: 5).stroke(eng.obsRnnoiseEnabled ? Color.orange.opacity(0.8) : Color.clear, lineWidth: 1))
+                    .cornerRadius(5)
+                }
+                .buttonStyle(.plain)
+                .help(eng.obsConnected
+                      ? eng.tr("Нейросетевой шумодав OBS RNNoise — вырезает перфоратор даже ВО ВРЕМЯ речи", "OBS AI RNNoise — suppresses construction noise even while speaking")
+                      : eng.tr("Запустите OBS Studio, чтобы управлять AI RNNoise прямо отсюда", "Start OBS Studio to toggle AI RNNoise"))
+
+                // Live Auto-Adaptive Noise Guard
                 Button(action: { eng.autoAdaptiveGuard.toggle(); eng.scheduleSaveConfig() }) {
                     HStack(spacing: 3.5) {
                         Image(systemName: eng.autoAdaptiveGuard ? "shield.lefthalf.filled.badge.checkmark" : "shield")
@@ -2445,14 +2773,14 @@ struct AudioMetersView: View {
                     .cornerRadius(5)
                 }
                 .buttonStyle(.plain)
-                .help(eng.tr("В паузах автоматически подстраивает RØDE Noise Gate и HPF 150Hz, если за окном началась или стихла стройка", "Automatically adapts RØDE Gate & HPF 150Hz during silence if outdoor construction starts or stops"))
             }
-            .padding(.horizontal, 10).padding(.vertical, 5.5)
+            .padding(.horizontal, 9).padding(.vertical, 5)
             .background(Color.black.opacity(0.24))
 
             hairlineH
 
-            if eng.permissionDenied {
+            // Permission Banners (Mic or System Audio ScreenCaptureKit)
+            if eng.permissionDenied && eng.sourceMode == .microphone {
                 HStack(spacing: 8) {
                     Image(systemName: "mic.slash.fill").foregroundColor(.orange)
                     Text(eng.tr("Дайте доступ к Микрофону: Системные настройки → Конфиденциальность → Микрофон", "Grant Microphone access in System Settings → Privacy & Security → Microphone"))
@@ -2462,50 +2790,62 @@ struct AudioMetersView: View {
                         if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone") { NSWorkspace.shared.open(u) }
                     }.buttonStyle(.borderedProminent).controlSize(.small)
                     Button(eng.tr("Повторить", "Retry")) { eng.requestMicAndStart() }.buttonStyle(.bordered).controlSize(.small)
-                }
-                .padding(.horizontal, 12).padding(.vertical, 6).background(Color.orange.opacity(0.14))
+                }.padding(.horizontal, 12).padding(.vertical, 6).background(Color.orange.opacity(0.14))
+            }
+            if !eng.systemAudioPermissionError.isEmpty && eng.sourceMode == .systemAudio {
+                HStack(spacing: 8) {
+                    Image(systemName: "speaker.slash.fill").foregroundColor(.orange)
+                    Text(eng.tr("Для захвата системного звука дайте доступ: Системные настройки → Запись экрана и системного аудио", "Grant Screen & System Audio Recording permission in System Settings"))
+                        .font(.system(size: 10.5, weight: .semibold)).foregroundColor(.orange)
+                    Spacer()
+                    Button(eng.tr("Настройки", "Settings")) {
+                        if let u = URL(string: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture") { NSWorkspace.shared.open(u) }
+                    }.buttonStyle(.borderedProminent).controlSize(.small)
+                    Button(eng.tr("Вернуть Мик", "Back to Mic")) { eng.setSourceMode(.microphone) }.buttonStyle(.bordered).controlSize(.small)
+                }.padding(.horizontal, 12).padding(.vertical, 6).background(Color.orange.opacity(0.14))
             }
 
-            // METERS WORKSPACE (MiniMeters + FabFilter Pro-Q + TDR Prism + Youlean)
+            // METERS WORKSPACE
             Group {
                 if eng.layoutMode == .bar {
                     HStack(spacing: 0) {
                         if eng.showWaveform {
-                            meterCell("WAVEFORM", badge: "MULTI-BAND") { MultiBandWaveformCanvas(slices: eng.coloredWave) }
-                                .frame(minWidth: 160)
+                            meterCell("WAVEFORM", badge: eng.rodeDsp.gateEnabled && eng.sourceMode == .microphone ? (eng.isGateOpen ? "GATE OPEN" : "GATE CLOSED") : "MULTI-BAND") {
+                                MultiBandWaveformCanvas(
+                                    slices: eng.coloredWave,
+                                    gateEnabled: eng.rodeDsp.gateEnabled && eng.sourceMode == .microphone,
+                                    gateThresholdDb: eng.rodeDsp.gateThresholdDb,
+                                    isGateOpen: eng.isGateOpen
+                                )
+                            }.frame(minWidth: 160)
                             hairlineV
                         }
                         if eng.showOscilloscope {
-                            meterCell("OSCILLOSCOPE", badge: eng.dominantNote) { OscilloscopeCanvas(samples: eng.oscilloscope, theme: eng.theme) }
-                                .frame(minWidth: 120, maxWidth: 170)
+                            meterCell("OSCILLOSCOPE", badge: eng.dominantNote) { OscilloscopeCanvas(samples: eng.oscilloscope, theme: eng.theme) }.frame(minWidth: 120, maxWidth: 170)
                             hairlineV
                         }
                         if eng.showSpectrum {
                             meterCell("SPECTRUM", badge: eng.dominantFreqHz > 0 ? String(format: "%.0fHz %@", eng.dominantFreqHz, eng.dominantNote) : "+\(String(format: "%.1f", eng.spectrumTilt))dB/o") {
                                 FabFilterSpectrumCanvas(curve: eng.spectrumCurve, peaks: eng.spectrumPeaks, frozen: eng.isFrozen ? eng.frozenSpectrum : nil, theme: eng.theme, showTargetCurve: eng.showTargetCurve, showVocalZones: eng.showVocalZones)
-                            }
-                            .frame(minWidth: 260)
+                            }.frame(minWidth: 260)
                             hairlineV
                         }
                         if eng.showSpectrogram {
-                            meterCell("SPECTROGRAM", badge: "MEL") { SpectrogramCanvas(grid: eng.spectrogram, theme: eng.theme) }
-                                .frame(minWidth: 150)
+                            meterCell("SPECTROGRAM", badge: "MEL") { SpectrogramCanvas(grid: eng.spectrogram, theme: eng.theme) }.frame(minWidth: 150)
                             hairlineV
                         }
                         if eng.showStereo {
-                            meterCell("STEREOMETER", badge: String(format: "Φ %+.2f", eng.stereoCorrelation)) { StereometerCanvas(points: eng.stereoXY, correlation: eng.stereoCorrelation, theme: eng.theme) }
-                                .frame(width: 118)
+                            meterCell("STEREOMETER", badge: String(format: "Φ %+.2f", eng.stereoCorrelation)) { StereometerCanvas(points: eng.stereoXY, correlation: eng.stereoCorrelation, theme: eng.theme) }.frame(width: 118)
                             hairlineV
                         }
-                        if eng.showLoudness {
-                            YouleanLoudnessCell(eng: eng).frame(width: 245)
-                        }
+                        if eng.showLoudness { YouleanLoudnessCell(eng: eng).frame(width: 245) }
                     }
                     .frame(minHeight: 115)
                 } else {
                     VStack(spacing: 0) {
                         HStack(spacing: 0) {
-                            meterCell("FABFILTER / TDR SPECTRUM (25Hz–20kHz)", badge: eng.dominantFreqHz > 0 ? String(format: "Peak: %.0f Hz (%@) • +%.1f dB/oct", eng.dominantFreqHz, eng.dominantNote, eng.spectrumTilt) : "+\(String(format: "%.1f", eng.spectrumTilt)) dB/oct") {
+                            meterCell(eng.sourceMode == .systemAudio ? "SYSTEM AUDIO SPECTRUM (25Hz–20kHz)" : "FABFILTER / TDR SPECTRUM (25Hz–20kHz)",
+                                      badge: eng.dominantFreqHz > 0 ? String(format: "Peak: %.0f Hz (%@) • +%.1f dB/oct", eng.dominantFreqHz, eng.dominantNote, eng.spectrumTilt) : "+\(String(format: "%.1f", eng.spectrumTilt)) dB/oct") {
                                 FabFilterSpectrumCanvas(curve: eng.spectrumCurve, peaks: eng.spectrumPeaks, frozen: eng.isFrozen ? eng.frozenSpectrum : nil, theme: eng.theme, showTargetCurve: eng.showTargetCurve, showVocalZones: eng.showVocalZones)
                             }
                             hairlineV
@@ -2514,30 +2854,29 @@ struct AudioMetersView: View {
                         .frame(minHeight: 155)
                         hairlineH
                         HStack(spacing: 0) {
-                            meterCell("MULTI-BAND WAVEFORM (BASS•MID•AIR)", badge: String(format: "RMS %.1f dB", eng.rmsDb)) {
-                                MultiBandWaveformCanvas(slices: eng.coloredWave)
+                            meterCell("MULTI-BAND WAVEFORM + GATE LINE",
+                                      badge: eng.rodeDsp.gateEnabled && eng.sourceMode == .microphone
+                                        ? String(format: "RMS %.1f dB • GATE %@", eng.rmsDb, eng.isGateOpen ? "OPEN" : "CLOSED")
+                                        : String(format: "RMS %.1f dB", eng.rmsDb)) {
+                                MultiBandWaveformCanvas(
+                                    slices: eng.coloredWave,
+                                    gateEnabled: eng.rodeDsp.gateEnabled && eng.sourceMode == .microphone,
+                                    gateThresholdDb: eng.rodeDsp.gateThresholdDb,
+                                    isGateOpen: eng.isGateOpen
+                                )
                             }
                             hairlineV
-                            meterCell("MEL SPECTROGRAM", badge: eng.theme.rawValue.uppercased()) {
-                                SpectrogramCanvas(grid: eng.spectrogram, theme: eng.theme)
-                            }
+                            meterCell("MEL SPECTROGRAM", badge: eng.theme.rawValue.uppercased()) { SpectrogramCanvas(grid: eng.spectrogram, theme: eng.theme) }
                             hairlineV
-                            meterCell("OSCILLOSCOPE", badge: eng.dominantNote) {
-                                OscilloscopeCanvas(samples: eng.oscilloscope, theme: eng.theme)
-                            }
-                            .frame(width: 165)
+                            meterCell("OSCILLOSCOPE", badge: eng.dominantNote) { OscilloscopeCanvas(samples: eng.oscilloscope, theme: eng.theme) }.frame(width: 165)
                             hairlineV
-                            meterCell("STEREOMETER", badge: String(format: "Φ %+.2f", eng.stereoCorrelation)) {
-                                StereometerCanvas(points: eng.stereoXY, correlation: eng.stereoCorrelation, theme: eng.theme)
-                            }
-                            .frame(width: 140)
+                            meterCell("STEREOMETER", badge: String(format: "Φ %+.2f", eng.stereoCorrelation)) { StereometerCanvas(points: eng.stereoXY, correlation: eng.stereoCorrelation, theme: eng.theme) }.frame(width: 140)
                         }
                         .frame(minHeight: 130)
                     }
                 }
             }
 
-            // LIVE RØDE NT1 5TH GEN DIRECT USB HARDWARE DSP PANEL
             if eng.showRodeDrawer {
                 hairlineH
                 RodeDSPDrawerView(eng: eng)
@@ -2552,12 +2891,22 @@ struct AudioMetersView: View {
 
     private func layoutPill(_ label: String, active: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            Text(label)
-                .font(.system(size: 9.5, weight: .heavy, design: .monospaced))
-                .padding(.horizontal, 7).padding(.vertical, 4)
+            Text(label).font(.system(size: 9.5, weight: .heavy, design: .monospaced))
+                .padding(.horizontal, 6.5).padding(.vertical, 4)
                 .background(active ? Color.white.opacity(0.20) : Color.white.opacity(0.05))
-                .foregroundColor(active ? .white : .secondary)
-                .cornerRadius(4.5)
+                .foregroundColor(active ? .white : .secondary).cornerRadius(4.5)
+        }.buttonStyle(.plain)
+    }
+
+    private func iconLayoutPill(_ icon: String, _ label: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 3) {
+                Image(systemName: icon).font(.system(size: 8.5, weight: .bold))
+                Text(label).font(.system(size: 9.5, weight: .bold))
+            }
+            .padding(.horizontal, 6.5).padding(.vertical, 4)
+            .background(active ? eng.theme.primary.opacity(0.24) : Color.white.opacity(0.05))
+            .foregroundColor(active ? eng.theme.primary : .secondary).cornerRadius(4.5)
         }.buttonStyle(.plain)
     }
 
@@ -2567,10 +2916,8 @@ struct AudioMetersView: View {
             HStack {
                 Text(title).font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundColor(.white.opacity(0.45))
                 Spacer()
-                Text(badge).font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundColor(eng.theme.primary.opacity(0.85))
-            }
-            .padding(.horizontal, 7).padding(.top, 4)
-            .allowsHitTesting(false)
+                Text(badge).font(.system(size: 8, weight: .bold, design: .monospaced)).foregroundColor(eng.theme.primary.opacity(0.88))
+            }.padding(.horizontal, 7).padding(.top, 4).allowsHitTesting(false)
         }
     }
 
@@ -2586,17 +2933,21 @@ struct AudioMetersView: View {
                     Spacer()
                     if r.appliedToHardware {
                         Text(eng.tr("✓ В RØDE NT1", "✓ Applied"))
-                            .font(.system(size: 10, weight: .bold))
-                            .padding(.horizontal, 7).padding(.vertical, 3)
+                            .font(.system(size: 10, weight: .bold)).padding(.horizontal, 7).padding(.vertical, 3)
                             .background(Color.green.opacity(0.22)).foregroundColor(.green).cornerRadius(5)
                     }
                 }
                 Text(r.diagnosisDetail).font(.system(size: 10.5)).foregroundColor(.secondary).fixedSize(horizontal: false, vertical: true)
                 Divider()
                 HStack(spacing: 8) {
+                    if let rt60 = r.rt60Seconds {
+                        calBox("RT60 Эхо", String(format: "%.2f с", rt60), ok: rt60 < 0.40)
+                    }
                     calBox(eng.tr("Фон", "Floor"), String(format: "%.0f dB", r.noiseFloorDb), ok: r.noiseFloorDb < -46)
-                    calBox(eng.tr("Пик шума", "Spike"), String(format: "%.0f dB", r.peakImpulseDb), ok: r.peakImpulseDb < -35)
-                    calBox(eng.tr("Гул <150Hz", "Rumble"), String(format: "%.0f dB", r.rumbleDb), ok: r.rumbleDb < -52)
+                    if r.rt60Seconds == nil {
+                        calBox(eng.tr("Пик шума", "Spike"), String(format: "%.0f dB", r.peakImpulseDb), ok: r.peakImpulseDb < -35)
+                        calBox(eng.tr("Гул <150Hz", "Rumble"), String(format: "%.0f dB", r.rumbleDb), ok: r.rumbleDb < -52)
+                    }
                     if let lufs = r.speechLufs {
                         calBox("LUFS", String(format: "%.1f", lufs), ok: abs(lufs - Double(eng.loudnessTarget.lufs)) <= 4.0)
                     }
@@ -2606,30 +2957,21 @@ struct AudioMetersView: View {
                 calRow("High-Pass:", r.suggestedDsp.hpfLabel)
                 calRow("Noise Gate:", "ON • Threshold \(Int(r.suggestedDsp.gateThresholdDb)) dB • Rel \(Int(r.suggestedDsp.gateReleaseMs)) ms")
                 calRow("Compressor:", "ON • \(Int(r.suggestedDsp.compThresholdDb)) dB • \(String(format: "%.1f", r.suggestedDsp.compRatio)):1 • +\(String(format: "%.1f", r.suggestedDsp.compGainDb)) dB")
-                calRow("Big Bottom:", r.suggestedDsp.bigBottomEnabled ? "ON (\(Int(r.suggestedDsp.bigBottomDrivePct))%)" : "OFF (\(eng.tr("чтобы не усиливать гул", "avoid low rumble")))")
-                calRow("Aural Exciter:", r.suggestedDsp.exciterEnabled ? "ON (\(Int(r.suggestedDsp.exciterMixPct))%, \(Int(r.suggestedDsp.exciterTuneHz)) Hz)" : "OFF")
+                calRow("Big Bottom:", r.suggestedDsp.bigBottomEnabled ? "ON (\(Int(r.suggestedDsp.bigBottomDrivePct))%)" : "OFF")
+                calRow("OBS RNNoise:", r.suggestedRnnoise ? "ON (\(eng.tr("режет стройку в речи", "AI noise guard")))" : "OFF (\(eng.tr("чистый звук", "pure DSP")))")
                 Divider()
                 HStack {
-                    Button(eng.tr("+ Сохранить комнату", "+ Save Room")) {
-                        eng.showScanPopover = false
-                        eng.showSaveRoomPopover = true
-                    }.buttonStyle(.bordered).controlSize(.small)
+                    Button(eng.tr("+ Сохранить комнату", "+ Save Room")) { eng.showScanPopover = false; eng.showSaveRoomPopover = true }.buttonStyle(.bordered).controlSize(.small)
                     Spacer()
                     if !r.appliedToHardware {
-                        Button(eng.tr("Применить в RØDE NT1", "Apply to RØDE NT1")) {
-                            eng.applyRodeSettingsNow(r.suggestedDsp, label: r.environmentLabel)
-                        }.buttonStyle(.borderedProminent).controlSize(.small)
+                        Button(eng.tr("Применить в RØDE NT1", "Apply to RØDE NT1")) { eng.applyRodeSettingsNow(r.suggestedDsp, label: r.environmentLabel) }.buttonStyle(.borderedProminent).controlSize(.small)
                     } else if eng.previousRodeDsp != nil {
-                        Button(eng.tr("↩ Откатить", "↩ Undo")) {
-                            eng.undoLastRodeChange()
-                            eng.showScanPopover = false
-                        }.buttonStyle(.bordered).controlSize(.small)
+                        Button(eng.tr("↩ Откатить", "↩ Undo")) { eng.undoLastRodeChange(); eng.showScanPopover = false }.buttonStyle(.bordered).controlSize(.small)
                     }
                 }
-            }
-            .padding(14).frame(width: 440)
+            }.padding(14).frame(width: 450)
         } else {
-            Text(eng.tr("Нажмите «Авто-шум 5с» для замера", "Click Auto-Noise 5s to scan")).padding(12)
+            Text(eng.tr("Нажмите «Шум 5с» или «Эхо» для замера", "Click Noise 5s or Echo to scan")).padding(12)
         }
     }
 
@@ -2649,13 +2991,13 @@ struct AudioMetersView: View {
     }
 }
 
-// MARK: - Live RØDE NT1 5th Gen Hardware DSP Control Drawer (Direct USB HID + CoreAudio HAL!)
+// MARK: - Live RØDE NT1 5th Gen Hardware DSP Drawer (With A/B Slots, Mic Presets & Live Gate LED!)
 struct RodeDSPDrawerView: View {
     @ObservedObject var eng: AudioAnalyzerEngine
 
     var body: some View {
         VStack(spacing: 6) {
-            // Drawer Header
+            // Drawer Header + FabFilter-Style A / B Comparison Switcher!
             HStack(spacing: 8) {
                 HStack(spacing: 5) {
                     Circle().fill(eng.rodeConnected ? Color.green : Color.orange).frame(width: 7, height: 7)
@@ -2665,28 +3007,36 @@ struct RodeDSPDrawerView: View {
                         .font(.system(size: 10.5, weight: .bold))
                         .foregroundColor(eng.rodeConnected ? .primary : .orange)
                 }
-                Spacer()
-                Button(action: { eng.syncFromRodeHardware(silent: false) }) {
-                    HStack(spacing: 3) {
-                        Image(systemName: "arrow.clockwise")
-                        Text(eng.tr("Считать с мик.", "Read Mic"))
-                    }
-                    .font(.system(size: 9.5, weight: .semibold))
+
+                // A / B Hardware Comparison Slots!
+                HStack(spacing: 2) {
+                    abBtn("A", active: eng.activeABSlot == "A") { eng.switchABSlot("A") }
+                    abBtn("B", active: eng.activeABSlot == "B") { eng.switchABSlot("B") }
+                    Button(eng.activeABSlot == "A" ? "A→B" : "B→A") { eng.copyCurrentABToOther() }
+                        .font(.system(size: 8.5, weight: .bold, design: .monospaced))
+                        .padding(.horizontal, 5).padding(.vertical, 2.5)
+                        .background(Color.white.opacity(0.07)).foregroundColor(.secondary).cornerRadius(4)
+                        .buttonStyle(.plain)
+                        .help(eng.tr("Скопировать настройки в другой слот для A/B сравнения", "Copy current DSP to other slot for A/B comparison"))
                 }
-                .buttonStyle(.bordered).controlSize(.mini)
+
+                Spacer()
+
+                Button(action: { eng.syncFromRodeHardware(silent: false) }) {
+                    HStack(spacing: 3) { Image(systemName: "arrow.clockwise"); Text(eng.tr("Считать с мик.", "Read Mic")) }
+                        .font(.system(size: 9.5, weight: .semibold))
+                }.buttonStyle(.bordered).controlSize(.mini)
 
                 Button(action: { NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/RODE Central.app")) }) {
                     Text("RØDE Central ↗").font(.system(size: 9.5, weight: .semibold))
-                }
-                .buttonStyle(.bordered).controlSize(.mini)
+                }.buttonStyle(.bordered).controlSize(.mini)
             }
             .padding(.horizontal, 10).padding(.top, 7)
 
-            // Mic / Vocal Tone Presets Strip (Layers over Room Noise Presets!)
+            // Mic / Vocal Tone Presets Strip
             HStack(spacing: 6) {
                 Text(eng.tr("МИК ПРЕСЕТЫ:", "MIC PRESETS:"))
-                    .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
-                    .foregroundColor(.secondary)
+                    .font(.system(size: 8.5, weight: .heavy, design: .monospaced)).foregroundColor(.secondary)
 
                 ScrollView(.horizontal, showsIndicators: false) {
                     HStack(spacing: 5) {
@@ -2703,42 +3053,27 @@ struct RodeDSPDrawerView: View {
                                     .foregroundColor(isActive ? Color(red: 0.86, green: 0.72, blue: 1.0) : .primary.opacity(0.85))
                                     .overlay(RoundedRectangle(cornerRadius: 4.5).stroke(isActive ? eng.theme.secondary.opacity(0.85) : Color.clear, lineWidth: 1))
                                     .cornerRadius(4.5)
-                                }
-                                .buttonStyle(.plain)
-                                .help(preset.subtitle)
+                                }.buttonStyle(.plain).help(preset.subtitle)
 
                                 if !preset.isBuiltIn {
                                     Button(action: { eng.deleteCustomMicPreset(preset.id) }) {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.system(size: 9))
-                                            .foregroundColor(.secondary.opacity(0.7))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .help(eng.tr("Удалить пресет", "Delete preset"))
+                                        Image(systemName: "xmark.circle.fill").font(.system(size: 9)).foregroundColor(.secondary.opacity(0.7))
+                                    }.buttonStyle(.plain)
                                 }
                             }
                         }
 
-                        // + Save Custom Mic DSP Preset
                         Button(action: { eng.showSaveMicPresetPopover.toggle() }) {
-                            HStack(spacing: 2.5) {
-                                Image(systemName: "plus")
-                                Text(eng.tr("Пресет", "Preset"))
-                            }
-                            .font(.system(size: 9.5, weight: .semibold))
-                            .padding(.horizontal, 7).padding(.vertical, 3)
-                            .background(Color.white.opacity(0.06))
-                            .foregroundColor(.secondary)
-                            .cornerRadius(4.5)
+                            HStack(spacing: 2.5) { Image(systemName: "plus"); Text(eng.tr("Пресет", "Preset")) }
+                                .font(.system(size: 9.5, weight: .semibold))
+                                .padding(.horizontal, 7).padding(.vertical, 3)
+                                .background(Color.white.opacity(0.06)).foregroundColor(.secondary).cornerRadius(4.5)
                         }
                         .buttonStyle(.plain)
                         .popover(isPresented: $eng.showSaveMicPresetPopover, arrowEdge: .top) {
                             VStack(alignment: .leading, spacing: 8) {
-                                Text(eng.tr("Сохранить пресет микрофона", "Save RØDE Mic Preset"))
-                                    .font(.system(size: 12, weight: .bold))
-                                Text(eng.tr("Сохранит текущие настройки Gain, HPF, Gate, Compressor, Big Bottom и Exciter.", "Saves all current RØDE NT1 hardware DSP settings."))
-                                    .font(.system(size: 10)).foregroundColor(.secondary)
-                                TextField(eng.tr("Напр.: Мой дикторский, Стрим, Вокал...", "e.g. Broadcast, Stream, Vocal..."), text: $eng.newMicPresetName)
+                                Text(eng.tr("Сохранить пресет микрофона", "Save RØDE Mic Preset")).font(.system(size: 12, weight: .bold))
+                                TextField(eng.tr("Напр.: Мой дикторский, Стрим...", "e.g. Broadcast, Stream..."), text: $eng.newMicPresetName)
                                     .textFieldStyle(.roundedBorder).frame(width: 235)
                                 HStack {
                                     Spacer()
@@ -2747,24 +3082,19 @@ struct RodeDSPDrawerView: View {
                                         .buttonStyle(.borderedProminent).controlSize(.small)
                                         .disabled(eng.newMicPresetName.trimmingCharacters(in: .whitespaces).isEmpty)
                                 }
-                            }
-                            .padding(12)
+                            }.padding(12)
                         }
                     }
                 }
             }
             .padding(.horizontal, 10)
 
-            // 5 Hardware DSP Channel Cards Side-by-Side
+            // 5 Hardware DSP Channel Cards
             HStack(spacing: 7) {
-                // 1. Preamp Gain + HPF
+                // 1. Preamp & HPF
                 dspCard(title: "PREAMP & HPF", enabled: .constant(true), showToggle: false) {
-                    dspSlider(
-                        label: "Gain",
-                        valStr: String(format: "%.0f dB", eng.rodeDsp.inputGainDb),
-                        value: Binding(get: { eng.rodeDsp.inputGainDb }, set: { v in eng.updateRodeParam { $0.inputGainDb = v.rounded() } }),
-                        range: 0...60
-                    )
+                    dspSlider(label: "Gain", valStr: String(format: "%.0f dB", eng.rodeDsp.inputGainDb),
+                              value: Binding(get: { eng.rodeDsp.inputGainDb }, set: { v in eng.updateRodeParam { $0.inputGainDb = v.rounded() } }), range: 0...60)
                     HStack(spacing: 3) {
                         Text("HPF").font(.system(size: 9, weight: .bold)).foregroundColor(.secondary)
                         Spacer()
@@ -2774,36 +3104,25 @@ struct RodeDSPDrawerView: View {
                                 .padding(.horizontal, 6).padding(.vertical, 3)
                                 .background(eng.rodeDsp.hpfMode == mode ? eng.theme.primary.opacity(0.28) : Color.white.opacity(0.06))
                                 .foregroundColor(eng.rodeDsp.hpfMode == mode ? eng.theme.primary : .secondary)
-                                .cornerRadius(4)
-                                .buttonStyle(.plain)
+                                .cornerRadius(4).buttonStyle(.plain)
                         }
                     }
                 }
 
-                // 2. Noise Gate
-                dspCard(title: "NOISE GATE", enabled: Binding(get: { eng.rodeDsp.gateEnabled }, set: { v in eng.updateRodeParam { $0.gateEnabled = v } })) {
-                    dspSlider(
-                        label: "Thresh",
-                        valStr: String(format: "%.0f dB", eng.rodeDsp.gateThresholdDb),
-                        value: Binding(get: { eng.rodeDsp.gateThresholdDb }, set: { v in eng.updateRodeParam { $0.gateThresholdDb = v.rounded() } }),
-                        range: -70...(-15)
-                    )
-                    dspSlider(
-                        label: "Release",
-                        valStr: String(format: "%.0f ms", eng.rodeDsp.gateReleaseMs),
-                        value: Binding(get: { eng.rodeDsp.gateReleaseMs }, set: { v in eng.updateRodeParam { $0.gateReleaseMs = (v / 10).rounded() * 10 } }),
-                        range: 50...450
-                    )
+                // 2. Noise Gate (with Live OPEN / CLOSED Hardware Status LED!)
+                dspCard(title: "NOISE GATE",
+                        statusBadge: eng.rodeDsp.gateEnabled ? (eng.isGateOpen ? ("OPEN", .green) : (eng.gateNearBreakthrough ? ("NEAR", .orange) : ("CLOSED", .gray))) : nil,
+                        enabled: Binding(get: { eng.rodeDsp.gateEnabled }, set: { v in eng.updateRodeParam { $0.gateEnabled = v } })) {
+                    dspSlider(label: "Thresh", valStr: String(format: "%.0f dB", eng.rodeDsp.gateThresholdDb),
+                              value: Binding(get: { eng.rodeDsp.gateThresholdDb }, set: { v in eng.updateRodeParam { $0.gateThresholdDb = v.rounded() } }), range: -70...(-15))
+                    dspSlider(label: "Release", valStr: String(format: "%.0f ms", eng.rodeDsp.gateReleaseMs),
+                              value: Binding(get: { eng.rodeDsp.gateReleaseMs }, set: { v in eng.updateRodeParam { $0.gateReleaseMs = (v / 10).rounded() * 10 } }), range: 50...450)
                 }
 
                 // 3. Compressor
                 dspCard(title: "COMPRESSOR", enabled: Binding(get: { eng.rodeDsp.compEnabled }, set: { v in eng.updateRodeParam { $0.compEnabled = v } })) {
-                    dspSlider(
-                        label: "Thresh",
-                        valStr: String(format: "%.0f dB", eng.rodeDsp.compThresholdDb),
-                        value: Binding(get: { eng.rodeDsp.compThresholdDb }, set: { v in eng.updateRodeParam { $0.compThresholdDb = v.rounded() } }),
-                        range: -50...(-5)
-                    )
+                    dspSlider(label: "Thresh", valStr: String(format: "%.0f dB", eng.rodeDsp.compThresholdDb),
+                              value: Binding(get: { eng.rodeDsp.compThresholdDb }, set: { v in eng.updateRodeParam { $0.compThresholdDb = v.rounded() } }), range: -50...(-5))
                     VStack(spacing: 1.5) {
                         HStack(spacing: 3) {
                             Text("Ratio").font(.system(size: 9)).foregroundColor(.secondary)
@@ -2821,34 +3140,18 @@ struct RodeDSPDrawerView: View {
 
                 // 4. APHEX Big Bottom
                 dspCard(title: "BIG BOTTOM", enabled: Binding(get: { eng.rodeDsp.bigBottomEnabled }, set: { v in eng.updateRodeParam { $0.bigBottomEnabled = v } })) {
-                    dspSlider(
-                        label: "Drive",
-                        valStr: String(format: "%.0f%%", eng.rodeDsp.bigBottomDrivePct),
-                        value: Binding(get: { eng.rodeDsp.bigBottomDrivePct }, set: { v in eng.updateRodeParam { $0.bigBottomDrivePct = v.rounded() } }),
-                        range: 0...100
-                    )
-                    dspSlider(
-                        label: "Tune",
-                        valStr: String(format: "%.0f Hz", eng.rodeDsp.bigBottomTuneHz),
-                        value: Binding(get: { eng.rodeDsp.bigBottomTuneHz }, set: { v in eng.updateRodeParam { $0.bigBottomTuneHz = v.rounded() } }),
-                        range: 60...240
-                    )
+                    dspSlider(label: "Drive", valStr: String(format: "%.0f%%", eng.rodeDsp.bigBottomDrivePct),
+                              value: Binding(get: { eng.rodeDsp.bigBottomDrivePct }, set: { v in eng.updateRodeParam { $0.bigBottomDrivePct = v.rounded() } }), range: 0...100)
+                    dspSlider(label: "Tune", valStr: String(format: "%.0f Hz", eng.rodeDsp.bigBottomTuneHz),
+                              value: Binding(get: { eng.rodeDsp.bigBottomTuneHz }, set: { v in eng.updateRodeParam { $0.bigBottomTuneHz = v.rounded() } }), range: 60...240)
                 }
 
                 // 5. APHEX Aural Exciter
                 dspCard(title: "AURAL EXCITER", enabled: Binding(get: { eng.rodeDsp.exciterEnabled }, set: { v in eng.updateRodeParam { $0.exciterEnabled = v } })) {
-                    dspSlider(
-                        label: "Mix",
-                        valStr: String(format: "%.0f%%", eng.rodeDsp.exciterMixPct),
-                        value: Binding(get: { eng.rodeDsp.exciterMixPct }, set: { v in eng.updateRodeParam { $0.exciterMixPct = v.rounded() } }),
-                        range: 0...100
-                    )
-                    dspSlider(
-                        label: "Tune",
-                        valStr: String(format: "%.1f kHz", eng.rodeDsp.exciterTuneHz / 1000.0),
-                        value: Binding(get: { eng.rodeDsp.exciterTuneHz }, set: { v in eng.updateRodeParam { $0.exciterTuneHz = (v / 100).rounded() * 100 } }),
-                        range: 600...5000
-                    )
+                    dspSlider(label: "Mix", valStr: String(format: "%.0f%%", eng.rodeDsp.exciterMixPct),
+                              value: Binding(get: { eng.rodeDsp.exciterMixPct }, set: { v in eng.updateRodeParam { $0.exciterMixPct = v.rounded() } }), range: 0...100)
+                    dspSlider(label: "Tune", valStr: String(format: "%.1f kHz", eng.rodeDsp.exciterTuneHz / 1000.0),
+                              value: Binding(get: { eng.rodeDsp.exciterTuneHz }, set: { v in eng.updateRodeParam { $0.exciterTuneHz = (v / 100).rounded() * 100 } }), range: 600...5000)
                 }
             }
             .padding(.horizontal, 10).padding(.bottom, 9)
@@ -2856,23 +3159,34 @@ struct RodeDSPDrawerView: View {
         .background(Color.black.opacity(0.32))
     }
 
-    private func dspCard<Content: View>(title: String, enabled: Binding<Bool>, showToggle: Bool = true, @ViewBuilder content: () -> Content) -> some View {
+    private func abBtn(_ lbl: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(lbl, action: action)
+            .font(.system(size: 9, weight: .heavy, design: .monospaced))
+            .padding(.horizontal, 6).padding(.vertical, 2.5)
+            .background(active ? eng.theme.primary.opacity(0.30) : Color.white.opacity(0.06))
+            .foregroundColor(active ? eng.theme.primary : .secondary)
+            .overlay(RoundedRectangle(cornerRadius: 4).stroke(active ? eng.theme.primary.opacity(0.8) : Color.clear, lineWidth: 0.9))
+            .cornerRadius(4).buttonStyle(.plain)
+    }
+
+    private func dspCard<Content: View>(title: String, statusBadge: (String, Color)? = nil, enabled: Binding<Bool>, showToggle: Bool = true, @ViewBuilder content: () -> Content) -> some View {
         VStack(alignment: .leading, spacing: 5) {
-            HStack {
-                Text(title)
-                    .font(.system(size: 8.5, weight: .heavy, design: .monospaced))
-                    .foregroundColor(enabled.wrappedValue ? eng.theme.primary : .secondary)
-                Spacer()
-                if showToggle {
-                    Toggle("", isOn: enabled).labelsHidden().toggleStyle(.switch).controlSize(.mini)
+            HStack(spacing: 4) {
+                Text(title).font(.system(size: 8.5, weight: .heavy, design: .monospaced)).foregroundColor(enabled.wrappedValue ? eng.theme.primary : .secondary)
+                if let (bTxt, bCol) = statusBadge {
+                    HStack(spacing: 2.5) {
+                        Circle().fill(bCol).frame(width: 5, height: 5)
+                        Text(bTxt).font(.system(size: 7.5, weight: .heavy, design: .monospaced)).foregroundColor(bCol)
+                    }
+                    .padding(.horizontal, 4).padding(.vertical, 1)
+                    .background(bCol.opacity(0.16)).cornerRadius(3)
                 }
+                Spacer()
+                if showToggle { Toggle("", isOn: enabled).labelsHidden().toggleStyle(.switch).controlSize(.mini) }
             }
-            content()
-                .opacity(enabled.wrappedValue ? 1.0 : 0.42)
-                .disabled(!enabled.wrappedValue)
+            content().opacity(enabled.wrappedValue ? 1.0 : 0.42).disabled(!enabled.wrappedValue)
         }
-        .padding(8)
-        .frame(maxWidth: .infinity)
+        .padding(8).frame(maxWidth: .infinity)
         .background(Color.white.opacity(0.045))
         .overlay(RoundedRectangle(cornerRadius: 7).stroke(Color.white.opacity(0.08), lineWidth: 0.8))
         .cornerRadius(7)
@@ -2890,45 +3204,63 @@ struct RodeDSPDrawerView: View {
     }
 }
 
-// MARK: - 1. Multi-Band Waveform Canvas
+// MARK: - 1. Multi-Band Waveform + Visual Noise Gate Threshold Overlay!
 struct MultiBandWaveformCanvas: View {
     let slices: [ColoredWaveSlice]
+    let gateEnabled: Bool
+    let gateThresholdDb: Double
+    let isGateOpen: Bool
+
     var body: some View {
         Canvas { ctx, size in
             let w = size.width; let h = size.height; let midY = h * 0.54
             for frac in [0.24, 0.54, 0.84] {
-                var p = Path()
-                p.move(to: CGPoint(x: 0, y: h * frac)); p.addLine(to: CGPoint(x: w, y: h * frac))
+                var p = Path(); p.move(to: CGPoint(x: 0, y: h * frac)); p.addLine(to: CGPoint(x: w, y: h * frac))
                 ctx.stroke(p, with: .color(Color.white.opacity(frac == 0.54 ? 0.12 : 0.04)), lineWidth: 0.6)
             }
-            let count = slices.count; guard count > 0 else { return }
-            let dx = w / CGFloat(count); let barW = max(1.0, dx * 0.86)
-            for i in 0..<count {
-                let s = slices[i]
-                let amp = max(1.0, CGFloat(s.amplitude) * (h * 0.42))
-                let rect = CGRect(x: CGFloat(i) * dx, y: midY - amp, width: barW, height: amp * 2.0)
-                ctx.fill(Path(roundedRect: rect, cornerRadius: 0.7), with: .color(s.color.opacity(0.92)))
+            let count = slices.count
+            if count > 0 {
+                let dx = w / CGFloat(count); let barW = max(1.0, dx * 0.86)
+                for i in 0..<count {
+                    let s = slices[i]
+                    let amp = max(1.0, CGFloat(s.amplitude) * (h * 0.42))
+                    let rect = CGRect(x: CGFloat(i) * dx, y: midY - amp, width: barW, height: amp * 2.0)
+                    ctx.fill(Path(roundedRect: rect, cornerRadius: 0.7), with: .color(s.color.opacity(0.92)))
+                }
+            }
+            // Crisp symmetric dashed Noise Gate Threshold lines!
+            if gateEnabled {
+                let linAmp = min(0.95, CGFloat(pow(10.0, gateThresholdDb / 20.0)) * 1.35)
+                let dy = max(3.5, linAmp * (h * 0.42))
+                let gateCol: Color = isGateOpen ? Color.green.opacity(0.65) : Color.orange.opacity(0.75)
+                for sign in [-1.0, 1.0] {
+                    var gp = Path()
+                    let y = midY + CGFloat(sign) * dy
+                    gp.move(to: CGPoint(x: 0, y: y)); gp.addLine(to: CGPoint(x: w, y: y))
+                    ctx.stroke(gp, with: .color(gateCol), style: StrokeStyle(lineWidth: 0.9, dash: [4, 3]))
+                }
+                let pillY = max(16, midY - dy - 13)
+                ctx.fill(Path(roundedRect: CGRect(x: 5, y: pillY, width: 56, height: 11), cornerRadius: 3), with: .color(Color.black.opacity(0.72)))
+                let lbl = Text("GATE \(Int(gateThresholdDb))dB").font(.system(size: 7, weight: .bold, design: .monospaced)).foregroundColor(gateCol)
+                ctx.draw(lbl, at: CGPoint(x: 33, y: pillY + 5.5))
             }
         }
     }
 }
 
-// MARK: - 2. Pitch-Locked Oscilloscope Canvas
+// MARK: - 2..6 Canvases (Oscilloscope, FabFilter Spectrum, Spectrogram, Stereometer, Youlean Loudness)
 struct OscilloscopeCanvas: View {
     let samples: [Float]; let theme: MeterTheme
     var body: some View {
         Canvas { ctx, size in
             let w = size.width; let h = size.height; let midY = h * 0.54
-            var cLine = Path()
-            cLine.move(to: CGPoint(x: 0, y: midY)); cLine.addLine(to: CGPoint(x: w, y: midY))
+            var cLine = Path(); cLine.move(to: CGPoint(x: 0, y: midY)); cLine.addLine(to: CGPoint(x: w, y: midY))
             ctx.stroke(cLine, with: .color(Color.white.opacity(0.08)), lineWidth: 0.6)
             guard samples.count > 1 else { return }
-            let dx = w / CGFloat(samples.count - 1)
-            var path = Path()
+            let dx = w / CGFloat(samples.count - 1); var path = Path()
             for i in 0..<samples.count {
                 let y = midY - CGFloat(max(-1, min(1, samples[i] * 1.45))) * (h * 0.40)
-                if i == 0 { path.move(to: CGPoint(x: 0, y: y)) }
-                else { path.addLine(to: CGPoint(x: CGFloat(i) * dx, y: y)) }
+                if i == 0 { path.move(to: CGPoint(x: 0, y: y)) } else { path.addLine(to: CGPoint(x: CGFloat(i) * dx, y: y)) }
             }
             ctx.stroke(path, with: .color(theme.primary.opacity(0.32)), lineWidth: 4.0)
             ctx.stroke(path, with: .color(theme.primary), lineWidth: 1.5)
@@ -2936,7 +3268,6 @@ struct OscilloscopeCanvas: View {
     }
 }
 
-// MARK: - 3. FabFilter Pro-Q 4 + TDR Prism Spectrum Curve Canvas
 struct FabFilterSpectrumCanvas: View {
     let curve: [Float]; let peaks: [Float]; let frozen: [Float]?
     let theme: MeterTheme; let showTargetCurve: Bool; let showVocalZones: Bool
@@ -2951,21 +3282,14 @@ struct FabFilterSpectrumCanvas: View {
             let mid = CGPoint(x: (pts[i - 1].x + pts[i].x) * 0.5, y: (pts[i - 1].y + pts[i].y) * 0.5)
             path.addQuadCurve(to: mid, control: pts[i - 1])
         }
-        path.addLine(to: pts[n - 1])
-        return path
+        path.addLine(to: pts[n - 1]); return path
     }
 
     var body: some View {
         Canvas { ctx, size in
             let w = size.width; let h = size.height - 13; let topPad: CGFloat = 15
             if showVocalZones {
-                let zones: [(CGFloat, CGFloat, Color)] = [
-                    (0.00, 0.25, Color.red.opacity(0.06)),    // HPF 25-150Hz
-                    (0.25, 0.40, Color.orange.opacity(0.055)),// Mud 150-350Hz
-                    (0.65, 0.79, Color.green.opacity(0.06)),  // Presence 2-5kHz
-                    (0.81, 0.90, Color.yellow.opacity(0.055)) // Sibilance 5.5-9kHz
-                ]
-                for (x0, x1, col) in zones {
+                for (x0, x1, col) in [(CGFloat(0.00), CGFloat(0.25), Color.red.opacity(0.06)), (0.25, 0.40, Color.orange.opacity(0.055)), (0.65, 0.79, Color.green.opacity(0.06)), (0.81, 0.90, Color.yellow.opacity(0.055))] {
                     ctx.fill(Path(CGRect(x: w * x0, y: topPad, width: w * (x1 - x0), height: h - topPad)), with: .color(col))
                 }
             }
@@ -2974,28 +3298,23 @@ struct FabFilterSpectrumCanvas: View {
                 g.move(to: CGPoint(x: 0, y: y)); g.addLine(to: CGPoint(x: w, y: y))
                 ctx.stroke(g, with: .color(Color.white.opacity(0.055)), lineWidth: 0.6)
             }
-            let ticks: [(String, CGFloat)] = [("50", 0.10), ("150", 0.27), ("500", 0.45), ("1k", 0.55), ("3k", 0.71), ("8k", 0.86), ("16k", 0.96)]
-            for (lbl, pos) in ticks {
-                var vLine = Path()
-                vLine.move(to: CGPoint(x: w * pos, y: topPad)); vLine.addLine(to: CGPoint(x: w * pos, y: h))
+            for (lbl, pos) in [("50", CGFloat(0.10)), ("150", 0.27), ("500", 0.45), ("1k", 0.55), ("3k", 0.71), ("8k", 0.86), ("16k", 0.96)] {
+                var vLine = Path(); vLine.move(to: CGPoint(x: w * pos, y: topPad)); vLine.addLine(to: CGPoint(x: w * pos, y: h))
                 ctx.stroke(vLine, with: .color(Color.white.opacity(0.045)), lineWidth: 0.6)
                 ctx.draw(Text(lbl).font(.system(size: 7.5, weight: .medium, design: .monospaced)).foregroundColor(.white.opacity(0.40)), at: CGPoint(x: w * pos, y: h + 6.5))
             }
             if showTargetCurve {
-                let tp = buildSmoothPath(values: AudioAnalyzerEngine.vocalTargetCurve, w: w, h: h, topPad: topPad)
-                ctx.stroke(tp, with: .color(Color.yellow.opacity(0.30)), style: StrokeStyle(lineWidth: 1.0, dash: [4, 4]))
+                ctx.stroke(buildSmoothPath(values: AudioAnalyzerEngine.vocalTargetCurve, w: w, h: h, topPad: topPad), with: .color(Color.yellow.opacity(0.30)), style: StrokeStyle(lineWidth: 1.0, dash: [4, 4]))
             }
             ctx.stroke(buildSmoothPath(values: peaks, w: w, h: h, topPad: topPad), with: .color(theme.secondary.opacity(0.45)), lineWidth: 1.0)
             let mainStroke = buildSmoothPath(values: frozen ?? curve, w: w, h: h, topPad: topPad)
-            var fillPath = mainStroke
-            fillPath.addLine(to: CGPoint(x: w, y: h)); fillPath.addLine(to: CGPoint(x: 0, y: h)); fillPath.closeSubpath()
+            var fillPath = mainStroke; fillPath.addLine(to: CGPoint(x: w, y: h)); fillPath.addLine(to: CGPoint(x: 0, y: h)); fillPath.closeSubpath()
             ctx.fill(fillPath, with: .linearGradient(Gradient(colors: [theme.primary.opacity(0.42), theme.secondary.opacity(0.14), theme.primary.opacity(0.01)]), startPoint: CGPoint(x: 0, y: topPad), endPoint: CGPoint(x: 0, y: h)))
             ctx.stroke(mainStroke, with: .color(frozen != nil ? .cyan : theme.primary), lineWidth: 1.7)
         }
     }
 }
 
-// MARK: - 4. Mel Spectrogram Waterfall Canvas
 struct SpectrogramCanvas: View {
     let grid: [[Float]]; let theme: MeterTheme
     var body: some View {
@@ -3013,7 +3332,6 @@ struct SpectrogramCanvas: View {
     }
 }
 
-// MARK: - 5. Stereometer Canvas
 struct StereometerCanvas: View {
     let points: [(Float, Float)]; let correlation: Float; let theme: MeterTheme
     var body: some View {
@@ -3044,7 +3362,6 @@ struct StereometerCanvas: View {
     }
 }
 
-// MARK: - 6. Youlean Loudness Panel
 struct YouleanLoudnessCell: View {
     @ObservedObject var eng: AudioAnalyzerEngine
     private func normLufs(_ v: Float) -> CGFloat { CGFloat(max(0, min(1, (v + 48.0) / 48.0))) }
@@ -3065,8 +3382,7 @@ struct YouleanLoudnessCell: View {
                 youleanRow("PEAK",  String(format: "%.1f", eng.peakHoldDb), color: eng.isClipping ? .red : .yellow)
                 youleanRow("PLR",   String(format: "%.1f", eng.dynamicsPlrDb), color: (eng.dynamicsPlrDb >= 7.0 && eng.dynamicsPlrDb <= 16.0) ? .green : .orange)
                 youleanRow("FLOOR", String(format: "%.0f", eng.noiseFloorDb), color: eng.noiseFloorDb > -42 ? .orange : .secondary)
-            }
-            .padding(.horizontal, 8).padding(.vertical, 6).frame(width: 98)
+            }.padding(.horizontal, 8).padding(.vertical, 6).frame(width: 98)
 
             Rectangle().fill(Color.white.opacity(0.06)).frame(width: 0.6)
 
@@ -3074,12 +3390,10 @@ struct YouleanLoudnessCell: View {
                 Canvas { ctx, size in
                     let w = size.width; let h = size.height; let target = eng.loudnessTarget.lufs
                     let targetY = h * (1.0 - normLufs(target))
-                    let bandTop = h * (1.0 - normLufs(target + 2.5))
-                    let bandBot = h * (1.0 - normLufs(target - 2.5))
+                    let bandTop = h * (1.0 - normLufs(target + 2.5)); let bandBot = h * (1.0 - normLufs(target - 2.5))
                     ctx.fill(Path(CGRect(x: 0, y: bandTop, width: w, height: max(2, bandBot - bandTop))), with: .color(Color.green.opacity(0.10)))
                     var tLine = Path(); tLine.move(to: CGPoint(x: 0, y: targetY)); tLine.addLine(to: CGPoint(x: w, y: targetY))
                     ctx.stroke(tLine, with: .color(Color.green.opacity(0.55)), style: StrokeStyle(lineWidth: 0.9, dash: [3, 3]))
-
                     let hist = eng.lufsHistory; let n = hist.count; guard n > 1 else { return }
                     let dx = w / CGFloat(n - 1)
                     for i in 0..<n {
@@ -3091,21 +3405,16 @@ struct YouleanLoudnessCell: View {
                     }
                 }
                 Text("LUFS HISTORY").font(.system(size: 7.5, weight: .bold, design: .monospaced)).foregroundColor(.white.opacity(0.42)).padding(.leading, 6).padding(.top, 4)
-            }
-            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }.frame(maxWidth: .infinity, maxHeight: .infinity)
 
             GeometryReader { geo in
                 let h = geo.size.height - 10
                 ZStack(alignment: .bottom) {
                     RoundedRectangle(cornerRadius: 2).fill(Color.white.opacity(0.07))
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(LinearGradient(colors: [.green, .green, .yellow, .orange, .red], startPoint: .bottom, endPoint: .top))
-                        .frame(height: max(2, h * normDb(eng.peakDb)))
+                    RoundedRectangle(cornerRadius: 2).fill(LinearGradient(colors: [.green, .green, .yellow, .orange, .red], startPoint: .bottom, endPoint: .top)).frame(height: max(2, h * normDb(eng.peakDb)))
                     Rectangle().fill(eng.isClipping ? Color.red : Color.white).frame(height: 1.8).offset(y: -(h * normDb(eng.peakHoldDb) - 1))
-                }
-                .padding(.vertical, 5)
-            }
-            .frame(width: 11).padding(.trailing, 6)
+                }.padding(.vertical, 5)
+            }.frame(width: 11).padding(.trailing, 6)
         }
     }
 
@@ -3118,55 +3427,47 @@ struct YouleanLoudnessCell: View {
     }
 }
 
-// MARK: - AppDelegate (Standard Titled macOS Window + Full-Screen Overlay + Menu Bar)
+// MARK: - AppDelegate (Standard Titled macOS Window + Full-Screen Overlay + Menu Bar + Global Mute Status)
 final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate, NSMenuDelegate {
     var window: FloatingMetersPanel!
     var statusItem: NSStatusItem!
     let eng = AudioAnalyzerEngine()
 
     private func idealSize(for mode: MeterLayoutMode, drawer: Bool) -> NSSize {
-        let baseH: CGFloat = mode == .quad ? 400 : 215
+        let baseH: CGFloat = mode == .quad ? 405 : 215
         let extra: CGFloat = drawer ? 178 : 0
-        let w: CGFloat = mode == .quad ? 995 : 1080
+        let w: CGFloat = mode == .quad ? 1050 : 1120
         return NSSize(width: w, height: baseH + extra)
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSApp.appearance = NSAppearance(named: .darkAqua)
-
         let isShotBar  = CommandLine.arguments.contains("--screenshot")
         let isShotQuad = CommandLine.arguments.contains("--screenshot-quad")
 
         let defaultFrame: NSRect
         if isShotBar {
-            defaultFrame = NSRect(x: 100, y: 100, width: 1080, height: 225)
+            defaultFrame = NSRect(x: 100, y: 100, width: 1120, height: 225)
         } else if isShotQuad {
-            defaultFrame = NSRect(x: 100, y: 100, width: 995, height: 585)
+            defaultFrame = NSRect(x: 100, y: 100, width: 1050, height: 590)
         } else if let saved = eng.savedWindowFrame,
                   NSScreen.screens.contains(where: { $0.visibleFrame.intersects(saved) }) {
             defaultFrame = saved
         } else if let scr = NSScreen.main?.visibleFrame {
             let sz = idealSize(for: eng.layoutMode, drawer: eng.showRodeDrawer)
-            let w = min(sz.width, scr.width - 40)
-            let h = min(sz.height, scr.height - 60)
+            let w = min(sz.width, scr.width - 36); let h = min(sz.height, scr.height - 60)
             defaultFrame = NSRect(x: scr.midX - w / 2, y: scr.midY - h / 2, width: w, height: h)
         } else {
-            defaultFrame = NSRect(x: 120, y: 120, width: 980, height: 550)
+            defaultFrame = NSRect(x: 100, y: 100, width: 1050, height: 590)
         }
 
-        // STANDARD NATIVE MACOS WINDOW (NOT Frameless — real dark titlebar, easy drag & resize!)
-        window = FloatingMetersPanel(
-            contentRect: defaultFrame,
-            styleMask: [.titled, .closable, .miniaturizable, .resizable],
-            backing: .buffered,
-            defer: false
-        )
+        window = FloatingMetersPanel(contentRect: defaultFrame, styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.delegate = self
         window.title = "Mr. Audio Meters — RØDE NT1 5th Gen Studio"
         window.titleVisibility = .visible
         window.titlebarAppearsTransparent = false
         window.isMovableByWindowBackground = false
-        window.minSize = NSSize(width: 720, height: 195)
+        window.minSize = NSSize(width: 780, height: 195)
         window.maxSize = NSSize(width: 2400, height: 1100)
         window.backgroundColor = NSColor(calibratedRed: 0.045, green: 0.050, blue: 0.068, alpha: 1.0)
         window.isReleasedWhenClosed = false
@@ -3178,6 +3479,7 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         eng.onAlwaysOnTopChanged = { [weak self] enabled in self?.applyAlwaysOnTop(enabled) }
         eng.onOpacityChanged = { [weak self] val in self?.window?.alphaValue = CGFloat(val) }
         eng.onLayoutChanged = { [weak self] mode, drawer in self?.animateResize(mode: mode, drawer: drawer) }
+        eng.onMuteStateChanged = { [weak self] muted in self?.updateMenuBarMuteIcon(muted) }
         applyAlwaysOnTop(eng.alwaysOnTop)
 
         if isShotBar || isShotQuad {
@@ -3190,8 +3492,7 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
                     targetView.cacheDisplay(in: targetView.bounds, to: rep)
                     if let png = rep.representation(using: .png, properties: [:]) {
                         let fname = isShotQuad ? "audio_meters_quad.png" : "audio_meters_bar.png"
-                        let out = "\(NSHomeDirectory())/Desktop/PixelProCam/assets/screenshots/\(fname)"
-                        try? png.write(to: URL(fileURLWithPath: out))
+                        try? png.write(to: URL(fileURLWithPath: "\(NSHomeDirectory())/Desktop/PixelProCam/assets/screenshots/\(fname)"))
                     }
                 }
                 NSApp.terminate(nil)
@@ -3206,10 +3507,8 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     func animateResize(mode: MeterLayoutMode, drawer: Bool) {
         guard let win = window, let scr = NSScreen.main?.visibleFrame else { return }
-        let cur = win.frame
-        let target = idealSize(for: mode, drawer: drawer)
-        let newW = min(target.width, scr.width - 32)
-        let newH = min(target.height, scr.height - 40)
+        let cur = win.frame; let target = idealSize(for: mode, drawer: drawer)
+        let newW = min(target.width, scr.width - 32); let newH = min(target.height, scr.height - 40)
         let newX = max(scr.minX + 10, min(scr.maxX - newW - 10, cur.midX - newW / 2))
         let newY = max(scr.minY + 10, min(scr.maxY - newH - 10, cur.maxY - newH))
         win.setFrame(NSRect(x: newX, y: newY, width: newW, height: newH), display: true, animate: true)
@@ -3219,29 +3518,32 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         guard let panel = window else { return }
         if enabled {
             panel.styleMask.insert(.nonactivatingPanel)
-            panel.isFloatingPanel = true
-            panel.hidesOnDeactivate = false
-            panel.level = .statusBar
-            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.isFloatingPanel = true; panel.hidesOnDeactivate = false
+            panel.level = .statusBar; panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
             panel.orderFrontRegardless()
         } else {
             panel.styleMask.remove(.nonactivatingPanel)
-            panel.isFloatingPanel = false
-            panel.level = .normal
-            panel.collectionBehavior = [.fullScreenAuxiliary]
+            panel.isFloatingPanel = false; panel.level = .normal; panel.collectionBehavior = [.fullScreenAuxiliary]
         }
     }
 
     func setupMenuBar() {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let btn = statusItem.button {
+        updateMenuBarMuteIcon(eng.isGlobalMuted)
+        let menu = NSMenu(); menu.delegate = self; statusItem.menu = menu
+    }
+
+    func updateMenuBarMuteIcon(_ muted: Bool) {
+        guard let btn = statusItem?.button else { return }
+        if muted {
+            btn.image = NSImage(systemSymbolName: "mic.slash.fill", accessibilityDescription: "MUTED")
+            btn.imagePosition = .imageLeading
+            btn.attributedTitle = NSAttributedString(string: " MUTED", attributes: [.foregroundColor: NSColor.systemRed, .font: NSFont.boldSystemFont(ofSize: 12)])
+        } else {
             btn.image = NSImage(systemSymbolName: "waveform.path.ecg.rectangle", accessibilityDescription: "Mr. Audio Meters")
             btn.imagePosition = .imageLeading
-            btn.title = " Meters"
+            btn.attributedTitle = NSAttributedString(string: " Meters", attributes: [.font: NSFont.systemFont(ofSize: 12)])
         }
-        let menu = NSMenu()
-        menu.delegate = self
-        statusItem.menu = menu
     }
 
     func menuNeedsUpdate(_ menu: NSMenu) {
@@ -3249,34 +3551,40 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
         let showItem = NSMenuItem(title: eng.tr("Открыть Mr. Audio Meters", "Show Mr. Audio Meters"), action: #selector(showWin), keyEquivalent: "")
         showItem.target = self; menu.addItem(showItem)
 
-        menu.addItem(NSMenuItem.separator())
-        let scanItem = NSMenuItem(title: eng.tr("⚡ Авто-подбор по шуму (5 сек)", "⚡ 5s Room Noise Auto-Scan"), action: #selector(runNoiseScan), keyEquivalent: "")
-        scanItem.target = self; menu.addItem(scanItem)
+        let muteItem = NSMenuItem(title: eng.isGlobalMuted ? eng.tr("🎙 Включить микрофон (⌘⇧M)", "🎙 Unmute Mic (⌘⇧M)") : eng.tr("🔇 Выключить микрофон (⌘⇧M)", "🔇 Mute Mic (⌘⇧M)"), action: #selector(doMute), keyEquivalent: "")
+        muteItem.target = self; menu.addItem(muteItem)
 
+        let rnItem = NSMenuItem(title: eng.tr("🚧 OBS AI RNNoise (Перфоратор)", "🚧 OBS AI RNNoise"), action: #selector(doRnnoise), keyEquivalent: "")
+        rnItem.target = self; rnItem.state = eng.obsRnnoiseEnabled ? .on : .off; menu.addItem(rnItem)
+
+        menu.addItem(NSMenuItem.separator())
+        let scanItem = NSMenuItem(title: eng.tr("⚡ Авто-подбор по шуму (5с)", "⚡ 5s Room Noise Auto-Scan"), action: #selector(runNoiseScan), keyEquivalent: "")
+        scanItem.target = self; menu.addItem(scanItem)
+        let clapItem = NSMenuItem(title: eng.tr("👏 Тест эха комнаты (RT60)", "👏 Clap Echo Test (RT60)"), action: #selector(runClapTest), keyEquivalent: "")
+        clapItem.target = self; menu.addItem(clapItem)
+        let vcItem = NSMenuItem(title: eng.tr("🎧 Проверка голоса 5с → наушники", "🎧 5s Voice Check Playback"), action: #selector(runVoiceCheck), keyEquivalent: "")
+        vcItem.target = self; menu.addItem(vcItem)
+
+        menu.addItem(NSMenuItem.separator())
+        let rmHdr = NSMenuItem(title: eng.tr("🏠 Помещения", "🏠 Room Profiles"), action: nil, keyEquivalent: ""); rmHdr.isEnabled = false; menu.addItem(rmHdr)
         for p in eng.allProfiles {
             let item = NSMenuItem(title: (eng.activeProfileId == p.id ? "✓ " : "   ") + p.name, action: #selector(pickProfile(_:)), keyEquivalent: "")
-            item.representedObject = p.id
-            item.target = self
-            menu.addItem(item)
+            item.representedObject = p.id; item.target = self; menu.addItem(item)
         }
 
         menu.addItem(NSMenuItem.separator())
-        let micHdr = NSMenuItem(title: eng.tr("🎙 Пресеты микрофона (RØDE)", "🎙 Mic Voice Presets (RØDE)"), action: nil, keyEquivalent: "")
-        micHdr.isEnabled = false
-        menu.addItem(micHdr)
+        let micHdr = NSMenuItem(title: eng.tr("🎙 Пресеты микрофона (RØDE)", "🎙 Mic Voice Presets"), action: nil, keyEquivalent: ""); micHdr.isEnabled = false; menu.addItem(micHdr)
         for mp in eng.allMicPresets {
             let item = NSMenuItem(title: (eng.activeMicPresetId == mp.id ? "✓ " : "   ") + mp.name, action: #selector(pickMicPreset(_:)), keyEquivalent: "")
-            item.representedObject = mp.id
-            item.target = self
-            menu.addItem(item)
+            item.representedObject = mp.id; item.target = self; menu.addItem(item)
         }
 
         menu.addItem(NSMenuItem.separator())
         let pinItem = NSMenuItem(title: eng.tr("📌 Поверх всех окон (Full-Screen)", "📌 Always on Top"), action: #selector(togglePin), keyEquivalent: "")
         pinItem.target = self; pinItem.state = eng.alwaysOnTop ? .on : .off; menu.addItem(pinItem)
 
-        let clipItem = NSMenuItem(title: eng.tr("💾 Сохранить последние 10с WAV", "💾 Save Last 10s WAV"), action: #selector(saveClip), keyEquivalent: "")
-        clipItem.target = self; menu.addItem(clipItem)
+        let loginItem = NSMenuItem(title: eng.tr("🚀 Запускать при входе в macOS", "🚀 Launch at Login"), action: #selector(toggleLogin), keyEquivalent: "")
+        loginItem.target = self; loginItem.state = LaunchAgentManager.isEnabled ? .on : .off; menu.addItem(loginItem)
 
         menu.addItem(NSMenuItem.separator())
         let quitItem = NSMenuItem(title: eng.tr("🚪 Выйти", "🚪 Quit"), action: #selector(quitApp), keyEquivalent: "q")
@@ -3285,23 +3593,23 @@ final class MetersAppDelegate: NSObject, NSApplicationDelegate, NSWindowDelegate
 
     func windowDidMove(_ notification: Notification)   { eng.savedWindowFrame = window.frame; eng.scheduleSaveConfig() }
     func windowDidResize(_ notification: Notification) { eng.savedWindowFrame = window.frame; eng.scheduleSaveConfig() }
-    func applicationWillTerminate(_ notification: Notification) { eng.saveConfigNow(); eng.stopEngine() }
+    func applicationWillTerminate(_ notification: Notification) { eng.ensureUnmutedOnExit(); eng.saveConfigNow(); eng.stopEngine() }
 
-    @objc func showWin() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
-    @objc func runNoiseScan() { showWin(); eng.startNoiseAutoScan(fullWithVoice: false) }
+    @objc func showWin()       { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+    @objc func doMute()        { eng.toggleGlobalMute() }
+    @objc func doRnnoise()     { eng.toggleObsRnnoise() }
+    @objc func runNoiseScan()  { showWin(); eng.startNoiseAutoScan(fullWithVoice: false) }
+    @objc func runClapTest()   { showWin(); eng.startClapEchoTest() }
+    @objc func runVoiceCheck() { showWin(); eng.toggleVoiceCheck() }
     @objc func pickProfile(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String, let p = eng.allProfiles.first(where: { $0.id == id }) {
-            eng.applyRoomProfile(p)
-        }
+        if let id = sender.representedObject as? String, let p = eng.allProfiles.first(where: { $0.id == id }) { eng.applyRoomProfile(p) }
     }
     @objc func pickMicPreset(_ sender: NSMenuItem) {
-        if let id = sender.representedObject as? String, let mp = eng.allMicPresets.first(where: { $0.id == id }) {
-            eng.applyMicVoicePreset(mp)
-        }
+        if let id = sender.representedObject as? String, let mp = eng.allMicPresets.first(where: { $0.id == id }) { eng.applyMicVoicePreset(mp) }
     }
-    @objc func togglePin() { eng.setAlwaysOnTop(!eng.alwaysOnTop) }
-    @objc func saveClip()  { eng.saveLast10SecondsClip() }
-    @objc func quitApp()   { eng.saveConfigNow(); NSApp.terminate(nil) }
+    @objc func togglePin()   { eng.setAlwaysOnTop(!eng.alwaysOnTop) }
+    @objc func toggleLogin() { LaunchAgentManager.setEnabled(!LaunchAgentManager.isEnabled) }
+    @objc func quitApp()     { eng.ensureUnmutedOnExit(); eng.saveConfigNow(); NSApp.terminate(nil) }
 }
 
 let app = NSApplication.shared

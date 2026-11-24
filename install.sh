@@ -1,11 +1,12 @@
 #!/bin/bash
 set -e
 
-echo "🎬 Installing Mr. Pixel Camera v2.2 for macOS (by mrmo.es)..."
+echo "🎬 Installing Mr. Pixel Camera v2.2 + Mr. Audio Meters v2.5 for macOS (by mrmo.es)..."
 
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 OBS_LUT_DIR="$HOME/Library/Application Support/obs-studio/LUTs"
-APP_BUNDLE="$REPO_DIR/Mr. Pixel Camera.app"
+CAM_BUNDLE="$REPO_DIR/Mr. Pixel Camera.app"
+AUD_BUNDLE="$REPO_DIR/Mr. Audio Meters.app"
 
 # 1. Install 3D LUTs (.cube), GPU Shaders (.shader) & Optical Overlays (.png) into OBS Studio
 mkdir -p "$OBS_LUT_DIR"
@@ -16,12 +17,12 @@ if [ -d "$REPO_DIR/assets/shaders" ]; then
 fi
 echo "✅ Installed 3D LUTs, GPU Cinema Shaders & Overlays into: $OBS_LUT_DIR"
 
-# 2. Build Native macOS App Bundle (Apple Silicon / Intel)
-mkdir -p "$APP_BUNDLE/Contents/MacOS" "$APP_BUNDLE/Contents/Resources"
-cp -f "$REPO_DIR/assets/icons/AppIcon.icns" "$APP_BUNDLE/Contents/Resources/AppIcon.icns"
-cp -f "$REPO_DIR/assets/icons/mo_logo.png" "$APP_BUNDLE/Contents/Resources/mo_logo.png"
+# 2. Build Native Mr. Pixel Camera.app
+mkdir -p "$CAM_BUNDLE/Contents/MacOS" "$CAM_BUNDLE/Contents/Resources"
+cp -f "$REPO_DIR/assets/icons/AppIcon.icns" "$CAM_BUNDLE/Contents/Resources/AppIcon.icns"
+cp -f "$REPO_DIR/assets/icons/mo_logo.png" "$CAM_BUNDLE/Contents/Resources/mo_logo.png"
 
-cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
+cat > "$CAM_BUNDLE/Contents/Info.plist" << 'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -50,21 +51,70 @@ cat > "$APP_BUNDLE/Contents/Info.plist" << 'EOF'
 </plist>
 EOF
 
-echo "⚙️ Compiling PixelProCamStudio.swift with Apple Vision & SwiftUI..."
+echo "⚙️ Compiling Mr. Pixel Camera (SwiftUI + Apple Vision)..."
 /usr/bin/swiftc -O "$REPO_DIR/macos/PixelProCamStudio.swift" \
-    -o "$APP_BUNDLE/Contents/MacOS/PixelProCamStudio" \
+    -o "$CAM_BUNDLE/Contents/MacOS/PixelProCamStudio" \
     -framework Cocoa -framework SwiftUI -framework UniformTypeIdentifiers -framework Vision
 
 if [ -f "$REPO_DIR/bin/adb" ]; then
-    cp -f "$REPO_DIR/bin/adb" "$APP_BUNDLE/Contents/MacOS/adb"
-    chmod +x "$APP_BUNDLE/Contents/MacOS/adb"
+    cp -f "$REPO_DIR/bin/adb" "$CAM_BUNDLE/Contents/MacOS/adb"
+    chmod +x "$CAM_BUNDLE/Contents/MacOS/adb"
 fi
-codesign --force --deep --sign - "$APP_BUNDLE" >/dev/null 2>&1 || true
+codesign --force --deep --sign - "$CAM_BUNDLE" >/dev/null 2>&1 || true
+touch "$CAM_BUNDLE"
+echo "✅ Built: $CAM_BUNDLE"
 
-touch "$APP_BUNDLE"
-echo "✅ Built native macOS app: $APP_BUNDLE"
+# 3. Build Native Mr. Audio Meters.app (RØDE NT1 USB HID + CoreAudio + vDSP + ScreenCaptureKit + OBS RNNoise)
+mkdir -p "$AUD_BUNDLE/Contents/MacOS" "$AUD_BUNDLE/Contents/Resources"
+cp -f "$REPO_DIR/assets/icons/AudioMetersIcon.icns" "$AUD_BUNDLE/Contents/Resources/AppIcon.icns"
+cp -f "$REPO_DIR/assets/icons/mo_audio_logo.png" "$AUD_BUNDLE/Contents/Resources/mo_audio_logo.png"
+cp -f "$REPO_DIR/assets/icons/mo_logo.png" "$AUD_BUNDLE/Contents/Resources/mo_logo.png"
 
-# 3. Ensure OBS WebSocket v5 server is enabled on port 4455 (auth disabled for local loopback)
+cat > "$AUD_BUNDLE/Contents/Info.plist" << 'EOF'
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleExecutable</key>
+    <string>MrAudioMeters</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>es.mrmo.MrAudioMeters</string>
+    <key>CFBundleName</key>
+    <string>Mr. Audio Meters</string>
+    <key>CFBundleDisplayName</key>
+    <string>Mr. Audio Meters</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>2.5</string>
+    <key>CFBundleVersion</key>
+    <string>25</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>Mr. Audio Meters uses your microphone for real-time FFT spectrum, waveform, spectrogram, EBU R128 LUFS metering, RT60 echo measurement, and RØDE NT1 calibration.</string>
+    <key>NSScreenCaptureUsageDescription</key>
+    <string>Mr. Audio Meters optionally captures macOS System Audio (ScreenCaptureKit) when you switch the meter source to System Audio.</string>
+</dict>
+</plist>
+EOF
+
+echo "⚙️ Compiling Mr. Audio Meters v2.5 (Accelerate vDSP + IOKit HID + ScreenCaptureKit + Carbon)..."
+/usr/bin/swiftc -O "$REPO_DIR/macos/MrAudioMeters.swift" \
+    -o "$AUD_BUNDLE/Contents/MacOS/MrAudioMeters" \
+    -framework Cocoa -framework SwiftUI -framework AVFoundation -framework CoreAudio \
+    -framework AudioToolbox -framework Accelerate -framework IOKit \
+    -framework Carbon -framework ScreenCaptureKit -framework CoreMedia
+
+codesign --force --deep --sign - "$AUD_BUNDLE" >/dev/null 2>&1 || true
+touch "$AUD_BUNDLE"
+echo "✅ Built: $AUD_BUNDLE"
+
+# 4. Ensure OBS WebSocket v5 server is enabled on port 4455 (local loopback)
 OBS_WS_CFG="$HOME/Library/Application Support/obs-studio/plugin_config/obs-websocket/config.json"
 if [ -d "$(dirname "$OBS_WS_CFG")" ]; then
     cat > "$OBS_WS_CFG" << 'EOF'
@@ -80,5 +130,6 @@ EOF
     echo "✅ Configured OBS WebSocket v5 (port 4455)"
 fi
 
-echo "🚀 Launching Mr. Pixel Camera.app..."
-open "$APP_BUNDLE"
+echo "🚀 Launching Mr. Pixel Camera.app & Mr. Audio Meters.app..."
+open "$CAM_BUNDLE"
+open "$AUD_BUNDLE"
