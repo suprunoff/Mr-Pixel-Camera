@@ -491,6 +491,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
 
     private func configureInitialObsStudioSettings() {
         sendOBSRequest(type: "SetRecordDirectory", data: ["recordDirectory": capturesDir], id: "init_rec_dir")
+        sendOBSRequest(type: "StartVirtualCam", data: [:], id: "init_start_vcam")
         applyRodeLipSyncImmediate()
     }
 
@@ -667,19 +668,52 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             FileLogger.shared.log("OBS-AUTO", "OBS.app not found in /Applications")
             return
         }
-        FileLogger.shared.log("OBS-AUTO", "Auto-launching OBS Studio in background (--startvirtualcam --minimize-to-tray)")
+        FileLogger.shared.log("OBS-AUTO", "Auto-launching OBS Studio (--startvirtualcam)")
         let cfg = NSWorkspace.OpenConfiguration()
         cfg.activates = false
-        cfg.hides = true
-        cfg.arguments = ["--startvirtualcam", "--minimize-to-tray"]
+        cfg.hides = false
+        cfg.arguments = ["--startvirtualcam"]
         NSWorkspace.shared.openApplication(at: obsAppURL, configuration: cfg) { [weak self] _, err in
             if let err = err {
                 FileLogger.shared.log("OBS-ERR", "Failed to auto-launch OBS: \(err.localizedDescription)")
             } else {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 2.5) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 2.8) {
                     self?.connectOBS()
                 }
             }
+        }
+    }
+
+    func reconnectCameraAndVirtualCam() {
+        guard obsConnected else {
+            ensureObsRunningInBackground()
+            return
+        }
+        FileLogger.shared.log("CAMERA", "Re-initializing Pixel 10 Pro UVC capture & OBS Virtual Camera...")
+        let dims = captureDims
+        let num = is60FpsMode ? 60000240 : 30000030
+        let resJson = "{\"width\":\(dims.w),\"height\":\(dims.h)}"
+
+        // Toggle device off -> on so macos-avcapture-fast recovers cleanly from hot-plug
+        sendOBSRequest(type: "SetInputSettings", data: [
+            "inputName": "Pixel 10 Pro",
+            "inputSettings": ["device": ""],
+            "overlay": true
+        ])
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+            guard let self = self else { return }
+            self.sendOBSRequest(type: "SetInputSettings", data: [
+                "inputName": "Pixel 10 Pro",
+                "inputSettings": [
+                    "device": "0x10000018d14eee",
+                    "device_name": "Pixel 10 Pro",
+                    "buffering": false,
+                    "resolution": resJson,
+                    "frame_rate": ["denominator": 1000000, "numerator": num]
+                ],
+                "overlay": true
+            ])
+            self.sendOBSRequest(type: "StartVirtualCam", data: [:], id: "ensure_vcam")
         }
     }
 
@@ -1375,8 +1409,15 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 }
 
                 DispatchQueue.main.async {
+                    let wasDisconnected = !self.pixelConnected
                     if self.pixelConnected != connected {
                         self.pixelConnected = connected
+                        if connected && wasDisconnected {
+                            // Auto-recover OBS UVC capture when Pixel 10 Pro is hot-plugged
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.8) {
+                                self.reconnectCameraAndVirtualCam()
+                            }
+                        }
                     }
                     if connected && self.pixelScreenUnlocked != unlocked {
                         self.pixelScreenUnlocked = unlocked
@@ -2696,6 +2737,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         sysMenu.addItem(NSMenuItem.separator())
 
+        let reconnectCamItem = NSMenuItem(title: ctrl.tr("📹 Переподключить камеру и VirtualCam", "📹 Reconnect Camera & VirtualCam"), action: #selector(menuReconnectCam), keyEquivalent: "")
+        reconnectCamItem.target = self
+        sysMenu.addItem(reconnectCamItem)
+
         let restartObsItem = NSMenuItem(title: ctrl.tr("🔄 Перезапустить OBS Engine", "🔄 Restart OBS Engine"), action: #selector(menuRestartObs), keyEquivalent: "")
         restartObsItem.target = self
         sysMenu.addItem(restartObsItem)
@@ -2735,6 +2780,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func menuSet30Fps() { ctrl.setCameraFpsMode(use60Fps: false) }
     @objc func menuToggleAutoObs() { ctrl.toggleAutoStartObs(!ctrl.autoStartObsEnabled) }
     @objc func menuToggleLogin() { ctrl.toggleLaunchAtLogin(!ctrl.launchAtLoginEnabled) }
+    @objc func menuReconnectCam() { ctrl.reconnectCameraAndVirtualCam() }
     @objc func menuRestartObs() { ctrl.restartObsEngine() }
     @objc func menuOpenSite() { ctrl.openAuthorWebsite() }
     @objc func menuQuit() { NSApp.terminate(nil) }
