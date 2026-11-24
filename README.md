@@ -99,7 +99,8 @@ chmod +x install.sh
 ```text
 Mr-Pixel-Camera/
 ├── macos/
-│   └── PixelProCamStudio.swift      # Native macOS SwiftUI + AppKit + Vision AI Studio Deck (EN/RU)
+│   ├── PixelProCamStudio.swift      # Native macOS SwiftUI + AppKit + Vision AI Studio Deck (EN/RU)
+│   └── MrAudioMeters.swift          # Native macOS Audio Analyzer + Direct RØDE NT1 5th Gen USB HID DSP
 ├── assets/
 │   ├── luts/                        # 33x33x33 3D Cinema LUTs (.cube)
 │   ├── shaders/                     # Black Pro-Mist 1/4 Halation & Kodak 35mm Film Grain (.shader)
