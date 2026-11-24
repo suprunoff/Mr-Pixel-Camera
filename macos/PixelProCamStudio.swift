@@ -1614,6 +1614,14 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         NSWorkspace.shared.open(URL(fileURLWithPath: "/Applications/RODE Central.app"))
     }
 
+    func openAudioMetersApp() {
+        FileLogger.shared.log("AUDIO", "Opening Mr. Audio Meters.app")
+        let p1 = "\(NSHomeDirectory())/Desktop/PixelProCam/Mr. Audio Meters.app"
+        let p2 = "/Applications/Mr. Audio Meters.app"
+        let target = FileManager.default.fileExists(atPath: p1) ? p1 : p2
+        NSWorkspace.shared.open(URL(fileURLWithPath: target))
+    }
+
     func setRodeAudioMode(_ mode: String) {
         activeAudioPreset = mode
         if mode == "pure" {
@@ -2707,6 +2715,18 @@ struct StudioPanelView: View {
                             ))
                             .toggleStyle(.checkbox)
                             .font(.system(size: 10))
+
+                            Button(action: { ctrl.openAudioMetersApp() }) {
+                                HStack(spacing: 3) {
+                                    Image(systemName: "waveform.path.ecg")
+                                    Text("Meters")
+                                }
+                                .font(.system(size: 10, weight: .bold))
+                                .padding(.horizontal, 7).padding(.vertical, 3.5)
+                                .background(Color.cyan.opacity(0.20)).foregroundColor(.cyan).cornerRadius(5)
+                            }
+                            .buttonStyle(.plain)
+                            .help(ctrl.tr("Открыть анализатор звука Mr. Audio Meters (FFT, LUFS, Spectrogram)", "Open Mr. Audio Meters real-time FFT / LUFS / Spectrogram analyzer"))
 
                             Button(action: { ctrl.openRodeCentralApp() }) {
                                 HStack(spacing: 3) {
