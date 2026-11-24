@@ -8,7 +8,7 @@ uniform float Mist_Strength<
     float minimum = 0.0;
     float maximum = 1.0;
     float step = 0.01;
-> = 0.24;
+> = 0.34;
 
 uniform float Highlight_Threshold<
     string label = "Highlight Threshold";
@@ -16,7 +16,7 @@ uniform float Highlight_Threshold<
     float minimum = 0.30;
     float maximum = 0.95;
     float step = 0.01;
-> = 0.72;
+> = 0.65;
 
 uniform float Mist_Radius<
     string label = "Diffusion Radius (px)";
@@ -24,7 +24,7 @@ uniform float Mist_Radius<
     float minimum = 2.0;
     float maximum = 24.0;
     float step = 0.5;
-> = 12.0;
+> = 13.0;
 
 uniform float Halation_Warmth<
     string label = "Optical Halation Warmth";
@@ -32,7 +32,7 @@ uniform float Halation_Warmth<
     float minimum = 0.0;
     float maximum = 1.0;
     float step = 0.01;
-> = 0.40;
+> = 0.45;
 
 uniform float Shadow_Protect<
     string label = "Shadow Black Protection";
@@ -40,7 +40,7 @@ uniform float Shadow_Protect<
     float minimum = 0.0;
     float maximum = 1.0;
     float step = 0.01;
-> = 0.92;
+> = 0.90;
 
 float luma709(float3 c)
 {

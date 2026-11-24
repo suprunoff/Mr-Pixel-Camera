@@ -75,6 +75,48 @@ struct StudioMemorySlot: Codable {
     var sharpness: Double
 }
 
+// MARK: - Complete Auto-Saved Last Studio Setup Model
+struct StudioPersistentState: Codable {
+    var selectedLUT: String
+    var lutIntensity: Double
+    var proMistEnabled: Bool
+    var filmGrainEnabled: Bool
+    var vignetteEnabled: Bool
+    var letterboxEnabled: Bool
+    var brightness: Double
+    var contrast: Double
+    var saturation: Double
+    var vargamma: Double
+    var hueShift: Double
+    var sharpness: Double
+    var activeLightingPreset: String
+    var zoomLevel: Double
+    var panX: Double
+    var panY: Double
+    var isMirrored: Bool
+    var aiAutoFrameEnabled: Bool
+    var selectedPrimeFocal: String
+    var selectedPhysicalLens: String
+    var selectedResolution: String
+    var is60FpsMode: Bool
+    var rodeLipSyncMs: Double
+    var activeAudioPreset: String
+    var alwaysOnTop: Bool
+    var miniMode: Bool
+    var showPreview: Bool
+    var showGridOverlay: Bool
+    var isHQMode: Bool
+    var activeMemorySlot: Int
+    var windowX: Double?
+    var windowY: Double?
+}
+
+// MARK: - Floating NSPanel that Stays Visible Over macOS Full-Screen Apps
+final class FloatingStudioPanel: NSPanel {
+    override var canBecomeKey: Bool { true }
+    override var canBecomeMain: Bool { true }
+}
+
 // MARK: - Studio Controller v2.2
 final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDelegate {
     // Localization (EN / RU) & UI Modes
@@ -212,7 +254,12 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     private var colorUpdateWorkItem: DispatchWorkItem?
     private var lutUpdateWorkItem: DispatchWorkItem?
     private var syncUpdateWorkItem: DispatchWorkItem?
+    private var saveSetupWorkItem: DispatchWorkItem?
     private var lastAdbHealTime: Date = .distantPast
+    private var hasSavedLastSetup: Bool = false
+    private var knownObsFilters: Set<String> = []
+    var savedWindowOrigin: NSPoint? = nil
+    var onAlwaysOnTopChanged: ((Bool) -> Void)?
 
     let adbPath: String = {
         let bundled = Bundle.main.bundlePath + "/Contents/MacOS/adb"
@@ -247,6 +294,9 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         super.init()
         try? FileManager.default.createDirectory(atPath: capturesDir, withIntermediateDirectories: true)
         refreshSavedMemorySlots()
+        if !CommandLine.arguments.contains("--screenshot") {
+            loadLastSetup()
+        }
 
         FileLogger.shared.onNewLogLine = { [weak self] line in
             guard let self = self else { return }
@@ -279,6 +329,103 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         }
     }
 
+    // MARK: - Auto-Save & Auto-Restore Complete Last Setup
+    private let lastSetupKey = "mrpixel_last_setup_v1"
+
+    func loadLastSetup() {
+        guard let raw = UserDefaults.standard.data(forKey: lastSetupKey),
+              let s = try? JSONDecoder().decode(StudioPersistentState.self, from: raw) else {
+            return
+        }
+        hasSavedLastSetup = true
+        selectedLUT = s.selectedLUT
+        lutIntensity = s.lutIntensity
+        proMistEnabled = s.proMistEnabled
+        filmGrainEnabled = s.filmGrainEnabled
+        vignetteEnabled = s.vignetteEnabled
+        letterboxEnabled = s.letterboxEnabled
+        brightness = s.brightness
+        contrast = s.contrast
+        saturation = s.saturation
+        vargamma = s.vargamma
+        hueShift = s.hueShift
+        sharpness = s.sharpness
+        activeLightingPreset = s.activeLightingPreset
+        zoomLevel = s.zoomLevel
+        panX = s.panX
+        panY = s.panY
+        isMirrored = s.isMirrored
+        aiAutoFrameEnabled = s.aiAutoFrameEnabled
+        selectedPrimeFocal = s.selectedPrimeFocal
+        selectedPhysicalLens = s.selectedPhysicalLens
+        selectedResolution = s.selectedResolution
+        is60FpsMode = s.is60FpsMode
+        rodeLipSyncMs = s.rodeLipSyncMs
+        activeAudioPreset = s.activeAudioPreset
+        alwaysOnTop = s.alwaysOnTop
+        miniMode = s.miniMode
+        showPreview = s.showPreview
+        showGridOverlay = s.showGridOverlay
+        isHQMode = s.isHQMode
+        activeMemorySlot = s.activeMemorySlot
+        if let wx = s.windowX, let wy = s.windowY {
+            savedWindowOrigin = NSPoint(x: wx, y: wy)
+        }
+        FileLogger.shared.log("STATE", "Restored last studio setup (LUT=\(selectedLUT), ProMist=\(proMistEnabled), Grain=\(filmGrainEnabled), Res=\(selectedResolution), 60fps=\(is60FpsMode), Pin=\(alwaysOnTop))")
+    }
+
+    func scheduleSaveLastSetup() {
+        guard !CommandLine.arguments.contains("--screenshot") else { return }
+        saveSetupWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.saveLastSetupNow()
+        }
+        saveSetupWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: item)
+    }
+
+    func saveLastSetupNow() {
+        guard !CommandLine.arguments.contains("--screenshot") else { return }
+        let state = StudioPersistentState(
+            selectedLUT: selectedLUT,
+            lutIntensity: lutIntensity,
+            proMistEnabled: proMistEnabled,
+            filmGrainEnabled: filmGrainEnabled,
+            vignetteEnabled: vignetteEnabled,
+            letterboxEnabled: letterboxEnabled,
+            brightness: brightness,
+            contrast: contrast,
+            saturation: saturation,
+            vargamma: vargamma,
+            hueShift: hueShift,
+            sharpness: sharpness,
+            activeLightingPreset: activeLightingPreset,
+            zoomLevel: zoomLevel,
+            panX: panX,
+            panY: panY,
+            isMirrored: isMirrored,
+            aiAutoFrameEnabled: aiAutoFrameEnabled,
+            selectedPrimeFocal: selectedPrimeFocal,
+            selectedPhysicalLens: selectedPhysicalLens,
+            selectedResolution: selectedResolution,
+            is60FpsMode: is60FpsMode,
+            rodeLipSyncMs: rodeLipSyncMs,
+            activeAudioPreset: activeAudioPreset,
+            alwaysOnTop: alwaysOnTop,
+            miniMode: miniMode,
+            showPreview: showPreview,
+            showGridOverlay: showGridOverlay,
+            isHQMode: isHQMode,
+            activeMemorySlot: activeMemorySlot,
+            windowX: savedWindowOrigin.map { Double($0.x) },
+            windowY: savedWindowOrigin.map { Double($0.y) }
+        )
+        if let encoded = try? JSONEncoder().encode(state) {
+            UserDefaults.standard.set(encoded, forKey: lastSetupKey)
+            hasSavedLastSetup = true
+        }
+    }
+
     // MARK: - Live Preview Monitor Control
     func togglePreviewMonitor(_ enabled: Bool) {
         showPreview = enabled
@@ -294,6 +441,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         } else {
             previewState.image = nil
         }
+        scheduleSaveLastSetup()
         onWindowSizeChangeRequested?()
     }
 
@@ -302,6 +450,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         if enabled && showPreview {
             togglePreviewMonitor(false)
         }
+        scheduleSaveLastSetup()
         onWindowSizeChangeRequested?()
     }
 
@@ -532,13 +681,13 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                     self.pixelSceneItemId = id
                 } else if name.contains("Виньетка") {
                     self.vignetteSceneItemId = id
-                    self.vignetteEnabled = enabled
+                    if !self.hasSavedLastSetup { self.vignetteEnabled = enabled }
                 } else if name.contains("Заставка") {
                     self.standbySceneItemId = id
                     self.isPrivacyStandby = enabled
                 } else if name.contains("Кино-каше") {
                     self.letterboxSceneItemId = id
-                    self.letterboxEnabled = enabled
+                    if !self.hasSavedLastSetup { self.letterboxEnabled = enabled }
                     foundLetterbox = true
                 }
             }
@@ -550,8 +699,32 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                     "inputSettings": [
                         "file": "\(NSHomeDirectory())/Library/Application Support/obs-studio/LUTs/Cinema_Letterbox_235_1.png"
                     ],
-                    "sceneItemEnabled": false
+                    "sceneItemEnabled": self.letterboxEnabled
                 ], id: "create_letterbox")
+            }
+            if self.hasSavedLastSetup {
+                // Re-apply user's saved visual & framing setup cleanly to OBS
+                self.applyLUTDebounced()
+                self.applyColorCorrection()
+                self.applyFramingImmediate()
+                self.sendOBSRequest(type: "SetSceneItemEnabled", data: [
+                    "sceneName": "Сцена",
+                    "sceneItemId": self.vignetteSceneItemId,
+                    "sceneItemEnabled": self.vignetteEnabled
+                ])
+                if foundLetterbox {
+                    self.sendOBSRequest(type: "SetSceneItemEnabled", data: [
+                        "sceneName": "Сцена",
+                        "sceneItemId": self.letterboxSceneItemId,
+                        "sceneItemEnabled": self.letterboxEnabled
+                    ])
+                }
+                if self.aiAutoFrameEnabled && self.aiFrameTimer == nil {
+                    self.toggleAiAutoFraming(true)
+                }
+                if self.showPreview && self.previewTimer == nil {
+                    self.togglePreviewMonitor(true)
+                }
             }
         } else if reqId == "create_letterbox" {
             if let id = data["sceneItemId"] as? Int {
@@ -582,27 +755,39 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             let fpsNum = data["fpsNumerator"] as? Int ?? 60
             let outH = data["outputHeight"] as? Int ?? 1080
             DispatchQueue.main.async {
-                self.is60FpsMode = (fpsNum >= 50)
-                self.rodeLipSyncMs = self.is60FpsMode ? 35.0 : 65.0
+                let obsIs60 = (fpsNum >= 50)
+                let obsRes: String
                 switch outH {
-                case 720: self.selectedResolution = "720p"
-                case 480: self.selectedResolution = "480p"
-                case 360: self.selectedResolution = "360p"
-                default:  self.selectedResolution = "1080p"
+                case 720: obsRes = "720p"
+                case 480: obsRes = "480p"
+                case 360: obsRes = "360p"
+                default:  obsRes = "1080p"
+                }
+                if self.hasSavedLastSetup {
+                    if obsIs60 != self.is60FpsMode || obsRes != self.selectedResolution {
+                        self.applyVideoPipelineSettings()
+                    }
+                } else {
+                    self.is60FpsMode = obsIs60
+                    self.rodeLipSyncMs = self.is60FpsMode ? 35.0 : 65.0
+                    self.selectedResolution = obsRes
                 }
                 self.onStatusChangeForMenuBar?()
             }
         } else if reqId == "init_source_filters", let filters = data["filters"] as? [[String: Any]] {
             DispatchQueue.main.async {
+                var names = Set<String>()
                 for f in filters {
                     let name = f["filterName"] as? String ?? ""
                     let enabled = f["filterEnabled"] as? Bool ?? false
-                    if name == self.proMistFilterName {
-                        self.proMistEnabled = enabled
-                    } else if name == self.filmGrainFilterName {
-                        self.filmGrainEnabled = enabled
+                    names.insert(name)
+                    if !self.hasSavedLastSetup {
+                        if name == self.proMistFilterName { self.proMistEnabled = enabled }
+                        else if name == self.filmGrainFilterName { self.filmGrainEnabled = enabled }
                     }
                 }
+                self.knownObsFilters = names
+                self.ensureCinemaShaderFilters()
                 self.onStatusChangeForMenuBar?()
             }
         } else if reqId == "vision_frame_shot" {
@@ -845,6 +1030,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             aiFaceStatus = "OFF"
             FileLogger.shared.log("VISION-AI", "Disabled Apple Vision Auto-Framing")
         }
+        scheduleSaveLastSetup()
         onStatusChangeForMenuBar?()
     }
 
@@ -929,12 +1115,14 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     // MARK: - Switch UVC Capture Resolution & OBS Output Format
     func setCameraResolution(_ res: String) {
         selectedResolution = res
+        scheduleSaveLastSetup()
         applyVideoPipelineSettings()
     }
 
     func setCameraFpsMode(use60Fps: Bool) {
         is60FpsMode = use60Fps
         rodeLipSyncMs = use60Fps ? 35.0 : 65.0
+        scheduleSaveLastSetup()
         applyVideoPipelineSettings()
     }
 
@@ -1065,12 +1253,11 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     // MARK: - 2. Framing / Smooth Interpolated Dolly Zoom & Mirroring
     func setAlwaysOnTop(_ enabled: Bool) {
         alwaysOnTop = enabled
-        FileLogger.shared.log("WINDOW", "Always on Top = \(enabled)")
+        FileLogger.shared.log("WINDOW", "Always on Top (Full-Screen Overlay) = \(enabled)")
         DispatchQueue.main.async {
-            for win in NSApp.windows where win.title.contains("Mr. Pixel") || win.title.contains("PixelProCam") {
-                win.level = enabled ? .floating : .normal
-            }
+            self.onAlwaysOnTopChanged?(enabled)
         }
+        scheduleSaveLastSetup()
         onStatusChangeForMenuBar?()
     }
 
@@ -1078,6 +1265,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         isMirrored = enabled
         FileLogger.shared.log("MIRROR", "Horizontal Mirror = \(enabled)")
         applyFramingImmediate()
+        scheduleSaveLastSetup()
         onStatusChangeForMenuBar?()
     }
 
@@ -1118,6 +1306,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             "sceneItemId": pixelSceneItemId,
             "sceneItemTransform": transform
         ])
+        scheduleSaveLastSetup()
     }
 
     func smoothFrameTo(zoom targetZoom: Double, panX targetX: Double, panY targetY: Double) {
@@ -1184,27 +1373,79 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         }
         lutUpdateWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.04, execute: item)
+        scheduleSaveLastSetup()
+    }
+
+    func ensureCinemaShaderFilters() {
+        let lutDir = "\(NSHomeDirectory())/Library/Application Support/obs-studio/LUTs"
+        let proMistPath = "\(lutDir)/Cinema_Black_ProMist_14.shader"
+        let grainPath   = "\(lutDir)/Cinema_Kodak_35mm_Grain.shader"
+
+        if !knownObsFilters.contains(proMistFilterName), FileManager.default.fileExists(atPath: proMistPath) {
+            FileLogger.shared.log("OPTICS", "Auto-creating missing OBS shader filter: \(proMistFilterName)")
+            sendOBSRequest(type: "CreateSourceFilter", data: [
+                "sourceName": "Pixel 10 Pro",
+                "filterName": proMistFilterName,
+                "filterKind": "shader_filter",
+                "filterSettings": [
+                    "from_file": true,
+                    "shader_file_name": proMistPath,
+                    "Mist_Strength": 0.34,
+                    "Highlight_Threshold": 0.65,
+                    "Mist_Radius": 13.0,
+                    "Halation_Warmth": 0.45,
+                    "Shadow_Protect": 0.90
+                ]
+            ], id: "auto_create_promist")
+            sendOBSRequest(type: "SetSourceFilterIndex", data: [
+                "sourceName": "Pixel 10 Pro",
+                "filterName": proMistFilterName,
+                "filterIndex": 0
+            ])
+            knownObsFilters.insert(proMistFilterName)
+        }
+        sendOBSRequest(type: "SetSourceFilterEnabled", data: [
+            "sourceName": "Pixel 10 Pro",
+            "filterName": proMistFilterName,
+            "filterEnabled": proMistEnabled
+        ])
+
+        if !knownObsFilters.contains(filmGrainFilterName), FileManager.default.fileExists(atPath: grainPath) {
+            FileLogger.shared.log("OPTICS", "Auto-creating missing OBS shader filter: \(filmGrainFilterName)")
+            sendOBSRequest(type: "CreateSourceFilter", data: [
+                "sourceName": "Pixel 10 Pro",
+                "filterName": filmGrainFilterName,
+                "filterKind": "shader_filter",
+                "filterSettings": [
+                    "from_file": true,
+                    "shader_file_name": grainPath,
+                    "Grain_Amount": 0.018,
+                    "Grain_Size": 1.25,
+                    "Color_Grain": 0.16
+                ]
+            ], id: "auto_create_grain")
+            knownObsFilters.insert(filmGrainFilterName)
+        }
+        sendOBSRequest(type: "SetSourceFilterEnabled", data: [
+            "sourceName": "Pixel 10 Pro",
+            "filterName": filmGrainFilterName,
+            "filterEnabled": filmGrainEnabled
+        ])
     }
 
     func setProMist(_ enabled: Bool) {
         proMistEnabled = enabled
         FileLogger.shared.log("OPTICS", "Black Pro-Mist 1/4 Optical Halation = \(enabled)")
-        sendOBSRequest(type: "SetSourceFilterEnabled", data: [
-            "sourceName": "Pixel 10 Pro",
-            "filterName": proMistFilterName,
-            "filterEnabled": enabled
-        ])
+        ensureCinemaShaderFilters()
+        scheduleSaveLastSetup()
         onStatusChangeForMenuBar?()
     }
 
     func setFilmGrain(_ enabled: Bool) {
         filmGrainEnabled = enabled
         FileLogger.shared.log("OPTICS", "Kodak 35mm Organic Film Grain = \(enabled)")
-        sendOBSRequest(type: "SetSourceFilterEnabled", data: [
-            "sourceName": "Pixel 10 Pro",
-            "filterName": filmGrainFilterName,
-            "filterEnabled": enabled
-        ])
+        ensureCinemaShaderFilters()
+        scheduleSaveLastSetup()
         onStatusChangeForMenuBar?()
     }
 
@@ -1216,6 +1457,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             "sceneItemId": vignetteSceneItemId,
             "sceneItemEnabled": enabled
         ])
+        scheduleSaveLastSetup()
         onStatusChangeForMenuBar?()
     }
 
@@ -1227,6 +1469,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             "sceneItemId": letterboxSceneItemId,
             "sceneItemEnabled": enabled
         ])
+        scheduleSaveLastSetup()
         onStatusChangeForMenuBar?()
     }
 
@@ -1257,6 +1500,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         }
         colorUpdateWorkItem = item
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.03, execute: item)
+        scheduleSaveLastSetup()
     }
 
     func resetExposureAuto() {
@@ -1282,7 +1526,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         FileLogger.shared.log("PRESET", "Applied lighting preset: \(preset)")
         switch preset {
         case "day":
-            brightness = 0.015; contrast = 0.08; saturation = 0.06; vargamma = -0.02; hueShift = 0.0; sharpness = 0.06
+            brightness = -0.005; contrast = 0.12; saturation = 0.09; vargamma = -0.045; hueShift = 0.0; sharpness = 0.07
             selectLUT("sony"); lutIntensity = 0.75; applyLUTDebounced()
         case "evening":
             brightness = 0.028; contrast = 0.11; saturation = 0.04; vargamma = 0.03; hueShift = -2.5; sharpness = 0.05
@@ -1317,6 +1561,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             "inputAudioSyncOffset": ms
         ])
         FileLogger.shared.log("LIPSYNC", "RØDE NT1 5th Gen Hardware Audio Sync Offset = +\(ms) ms")
+        scheduleSaveLastSetup()
     }
 
     func toggleRodeMute() {
@@ -1548,6 +1793,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         FileLogger.shared.log("ADB", "Toggling Pixel HQ Mode (954, 2149)")
         runADBCommand("input keyevent KEYCODE_WAKEUP && am start -n com.android.DeviceAsWebcam/com.android.deviceaswebcam.DeviceAsWebcamPreview >/dev/null 2>&1 && input tap 954 2149")
         isHQMode.toggle()
+        scheduleSaveLastSetup()
     }
 
     private func runADBCommand(_ shellCmd: String) {
@@ -2603,8 +2849,8 @@ struct StudioPanelView: View {
 }
 
 // MARK: - AppDelegate with Persistent Top macOS Menu Bar (Bilingual EN/RU)
-class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
-    var window: NSWindow!
+class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDelegate {
+    var window: FloatingStudioPanel!
     var statusItem: NSStatusItem!
     let ctrl = StudioController()
 
@@ -2612,21 +2858,45 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSApp.appearance = NSAppearance(named: .darkAqua)
 
         let contentView = StudioPanelView(ctrl: ctrl)
-        window = NSWindow(
-            contentRect: NSRect(x: 0, y: 0, width: 716, height: 685),
+        var initH: CGFloat = ctrl.miniMode ? 118 : 685
+        if !ctrl.miniMode {
+            if ctrl.showPreview { initH += 192 }
+            if ctrl.showLogs { initH += 104 }
+        }
+        window = FloatingStudioPanel(
+            contentRect: NSRect(x: 0, y: 0, width: 716, height: initH),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
             backing: .buffered,
             defer: false
         )
-        window.center()
+        window.delegate = self
         window.title = "Mr. Pixel Camera v2.2 — mrmo.es"
         window.backgroundColor = NSColor(calibratedRed: 0.08, green: 0.09, blue: 0.12, alpha: 1.0)
         window.isReleasedWhenClosed = false
+        window.hidesOnDeactivate = false
+        window.worksWhenModal = true
         window.contentView = NSHostingView(rootView: contentView)
 
+        // Restore last saved window position if visible on a connected display
+        if let savedOrigin = ctrl.savedWindowOrigin,
+           NSScreen.screens.contains(where: { $0.visibleFrame.intersects(NSRect(origin: savedOrigin, size: NSSize(width: 200, height: 100))) }) {
+            window.setFrameOrigin(savedOrigin)
+        } else {
+            window.center()
+        }
+
+        ctrl.onAlwaysOnTopChanged = { [weak self] enabled in
+            self?.applyAlwaysOnTop(enabled)
+        }
+        applyAlwaysOnTop(ctrl.alwaysOnTop)
+
         if !CommandLine.arguments.contains("--background") {
-            window.makeKeyAndOrderFront(nil)
-            NSApp.activate(ignoringOtherApps: true)
+            if ctrl.alwaysOnTop {
+                window.orderFrontRegardless()
+            } else {
+                window.makeKeyAndOrderFront(nil)
+                NSApp.activate(ignoringOtherApps: true)
+            }
         }
 
         if CommandLine.arguments.contains("--screenshot") {
@@ -2669,6 +2939,37 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         ctrl.onWindowSizeChangeRequested = { [weak self] in
             self?.resizeWindowSmoothly()
         }
+    }
+
+    func applyAlwaysOnTop(_ enabled: Bool) {
+        guard let panel = window else { return }
+        if enabled {
+            panel.styleMask.insert(.nonactivatingPanel)
+            panel.isFloatingPanel = true
+            panel.hidesOnDeactivate = false
+            panel.level = .statusBar
+            panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            panel.orderFrontRegardless()
+        } else {
+            panel.styleMask.remove(.nonactivatingPanel)
+            panel.isFloatingPanel = false
+            panel.hidesOnDeactivate = false
+            panel.level = .normal
+            panel.collectionBehavior = [.fullScreenAuxiliary]
+        }
+    }
+
+    func windowDidMove(_ notification: Notification) {
+        guard let win = window else { return }
+        ctrl.savedWindowOrigin = win.frame.origin
+        ctrl.scheduleSaveLastSetup()
+    }
+
+    func applicationWillTerminate(_ notification: Notification) {
+        if let win = window {
+            ctrl.savedWindowOrigin = win.frame.origin
+        }
+        ctrl.saveLastSetupNow()
     }
 
     func resizeWindowSmoothly() {
@@ -2894,8 +3195,13 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func toggleMainWindow() {
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        if ctrl.alwaysOnTop {
+            applyAlwaysOnTop(true)
+            window.orderFrontRegardless()
+        } else {
+            window.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+        }
     }
 
     @objc func menuTogglePin() { ctrl.setAlwaysOnTop(!ctrl.alwaysOnTop) }
@@ -2931,8 +3237,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
-        window.makeKeyAndOrderFront(nil)
-        NSApp.activate(ignoringOtherApps: true)
+        toggleMainWindow()
         return true
     }
 
