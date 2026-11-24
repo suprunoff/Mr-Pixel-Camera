@@ -7,7 +7,7 @@ uniform float Grain_Amount<
     float minimum = 0.0;
     float maximum = 0.12;
     float step = 0.002;
-> = 0.018;
+> = 0.036;
 
 uniform float Grain_Size<
     string label = "Grain Size";
@@ -15,7 +15,7 @@ uniform float Grain_Size<
     float minimum = 1.0;
     float maximum = 3.0;
     float step = 0.05;
-> = 1.25;
+> = 1.50;
 
 uniform float Color_Grain<
     string label = "Organic Chroma Variance";
@@ -23,7 +23,7 @@ uniform float Color_Grain<
     float minimum = 0.0;
     float maximum = 1.0;
     float step = 0.02;
-> = 0.16;
+> = 0.22;
 
 float hash12(float2 p)
 {

@@ -107,6 +107,7 @@ struct StudioPersistentState: Codable {
     var showGridOverlay: Bool
     var isHQMode: Bool
     var activeMemorySlot: Int
+    var collapsedCards: [Int]?
     var windowX: Double?
     var windowY: Double?
 }
@@ -130,6 +131,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
     @Published var miniMode: Bool = false
     @Published var showPreview: Bool = false
     @Published var showGridOverlay: Bool = true
+    @Published var collapsedCards: Set<Int> = []
     @Published var activeMemorySlot: Int = 0 // 0 = none, 1..3 = M1..M3
     @Published var savedSlotsMask: Set<Int> = []
     @Published var autoStartObsEnabled: Bool = {
@@ -368,6 +370,9 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         showGridOverlay = s.showGridOverlay
         isHQMode = s.isHQMode
         activeMemorySlot = s.activeMemorySlot
+        if let cc = s.collapsedCards {
+            collapsedCards = Set(cc)
+        }
         if let wx = s.windowX, let wy = s.windowY {
             savedWindowOrigin = NSPoint(x: wx, y: wy)
         }
@@ -417,6 +422,7 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             showGridOverlay: showGridOverlay,
             isHQMode: isHQMode,
             activeMemorySlot: activeMemorySlot,
+            collapsedCards: Array(collapsedCards).sorted(),
             windowX: savedWindowOrigin.map { Double($0.x) },
             windowY: savedWindowOrigin.map { Double($0.y) }
         )
@@ -424,6 +430,35 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
             UserDefaults.standard.set(encoded, forKey: lastSetupKey)
             hasSavedLastSetup = true
         }
+    }
+
+    // MARK: - Accordion Collapse State & Dynamic Window Height
+    func toggleCardCollapsed(_ cardId: Int) {
+        if collapsedCards.contains(cardId) {
+            collapsedCards.remove(cardId)
+        } else {
+            collapsedCards.insert(cardId)
+        }
+        scheduleSaveLastSetup()
+        onWindowSizeChangeRequested?()
+    }
+
+    var targetWindowHeight: CGFloat {
+        if miniMode { return 118 }
+        var h: CGFloat = 685
+        let bodySavings: [Int: CGFloat] = [
+            1: 72,  // Card 1: Optics & Primes
+            2: 66,  // Card 2: Framing, 2D Pad & AI
+            3: 74,  // Card 3: 3D LUTs & Shaders
+            4: 102, // Card 4: Exposure, WB & Detail
+            5: 66   // Card 5: RØDE Audio & Lip-Sync
+        ]
+        for id in collapsedCards {
+            h -= (bodySavings[id] ?? 66)
+        }
+        if showPreview { h += 192 }
+        if showLogs { h += 104 }
+        return max(260, h)
     }
 
     // MARK: - Live Preview Monitor Control
@@ -1419,9 +1454,9 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
                 "filterSettings": [
                     "from_file": true,
                     "shader_file_name": grainPath,
-                    "Grain_Amount": 0.018,
-                    "Grain_Size": 1.25,
-                    "Color_Grain": 0.16
+                    "Grain_Amount": 0.036,
+                    "Grain_Size": 1.50,
+                    "Color_Grain": 0.22
                 ]
             ], id: "auto_create_grain")
             knownObsFilters.insert(filmGrainFilterName)
@@ -1650,10 +1685,56 @@ final class StudioController: NSObject, ObservableObject, URLSessionWebSocketDel
         isBlackoutEnabled = enabled
         FileLogger.shared.log("BLACKOUT", "OLED Blackout = \(enabled)")
         if enabled {
-            runADBCommand("svc power stayon usb && settings put system screen_brightness_mode 0 && settings put system screen_brightness 1")
+            // 1. Save real Pixel brightness & adaptive brightness mode before dimming (never overwrite if already saved).
+            // 2. Dim OLED to minimum (stayon usb).
+            // 3. Start a zero-CPU Android watcher: if USB cable is unplugged, Pixel itself restores exact brightness + Auto-Brightness within 2s!
+            let cmd = """
+            if [ ! -f /data/local/tmp/mrpixel_bright.env ]; then \
+              M=$(settings get system screen_brightness_mode 2>/dev/null); \
+              B=$(settings get system screen_brightness 2>/dev/null); \
+              case "$M" in 0|1) ;; *) M=1 ;; esac; \
+              case "$B" in ''|*[!0-9]*) B=140 ;; esac; \
+              if [ "$B" -lt 15 ]; then B=140; M=1; fi; \
+              printf 'SAVED_MODE=%s\\nSAVED_BRIGHT=%s\\n' "$M" "$B" > /data/local/tmp/mrpixel_bright.env; \
+            fi; \
+            if [ -f /data/local/tmp/mrpixel_blackout.pid ]; then kill $(cat /data/local/tmp/mrpixel_blackout.pid) 2>/dev/null || true; fi; \
+            svc power stayon usb && settings put system screen_brightness_mode 0 && settings put system screen_brightness 1; \
+            nohup sh -c 'echo $$ > /data/local/tmp/mrpixel_blackout.pid; while [ "$(cat /sys/class/power_supply/usb/online 2>/dev/null)" = "1" ]; do sleep 2; done; if [ -f /data/local/tmp/mrpixel_bright.env ]; then . /data/local/tmp/mrpixel_bright.env; settings put system screen_brightness_mode "${SAVED_MODE:-1}"; settings put system screen_brightness "${SAVED_BRIGHT:-140}"; rm -f /data/local/tmp/mrpixel_bright.env /data/local/tmp/mrpixel_blackout.pid; fi' >/dev/null 2>&1 &
+            """
+            runADBCommand(cmd)
         } else {
-            runADBCommand("settings put system screen_brightness 130")
+            let restoreCmd = """
+            if [ -f /data/local/tmp/mrpixel_blackout.pid ]; then kill $(cat /data/local/tmp/mrpixel_blackout.pid) 2>/dev/null || true; rm -f /data/local/tmp/mrpixel_blackout.pid; fi; \
+            if [ -f /data/local/tmp/mrpixel_bright.env ]; then \
+              . /data/local/tmp/mrpixel_bright.env; \
+              settings put system screen_brightness_mode "${SAVED_MODE:-1}"; \
+              settings put system screen_brightness "${SAVED_BRIGHT:-140}"; \
+              rm -f /data/local/tmp/mrpixel_bright.env; \
+            else \
+              settings put system screen_brightness_mode 1; \
+              settings put system screen_brightness 140; \
+            fi
+            """
+            runADBCommand(restoreCmd)
         }
+        onStatusChangeForMenuBar?()
+    }
+
+    func restorePixelBrightnessSyncIfBlackedOut() {
+        guard isBlackoutEnabled, FileManager.default.isExecutableFile(atPath: adbPath) else { return }
+        isBlackoutEnabled = false
+        let restoreCmd = "if [ -f /data/local/tmp/mrpixel_blackout.pid ]; then kill $(cat /data/local/tmp/mrpixel_blackout.pid) 2>/dev/null || true; rm -f /data/local/tmp/mrpixel_blackout.pid; fi; if [ -f /data/local/tmp/mrpixel_bright.env ]; then . /data/local/tmp/mrpixel_bright.env; settings put system screen_brightness_mode \"${SAVED_MODE:-1}\"; settings put system screen_brightness \"${SAVED_BRIGHT:-140}\"; rm -f /data/local/tmp/mrpixel_bright.env; else settings put system screen_brightness_mode 1; settings put system screen_brightness 140; fi"
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: adbPath)
+        task.arguments = ["-s", pixelSerial, "shell", restoreCmd]
+        task.standardOutput = Pipe()
+        task.standardError = Pipe()
+        try? task.run()
+        let deadline = Date().addingTimeInterval(1.2)
+        while task.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.05)
+        }
+        if task.isRunning { task.terminate() }
     }
 
     // MARK: - 7. Pixel 10 Pro Hardware ADB Commands
@@ -1981,24 +2062,36 @@ struct InteractiveFramingPad: View {
     }
 }
 
-// MARK: - Pro Cinema Card Container
+// MARK: - Pro Cinema Collapsible Accordion Card Container
 struct StudioCard<Content: View>: View {
     let title: String
     let icon: String
     let accent: Color
     let trailingText: String?
+    let isCollapsed: Bool
+    let onToggleCollapse: () -> Void
     let content: Content
 
-    init(title: String, icon: String, accent: Color, trailingText: String? = nil, @ViewBuilder content: () -> Content) {
+    init(
+        title: String,
+        icon: String,
+        accent: Color,
+        trailingText: String? = nil,
+        isCollapsed: Bool = false,
+        onToggleCollapse: @escaping () -> Void = {},
+        @ViewBuilder content: () -> Content
+    ) {
         self.title = title
         self.icon = icon
         self.accent = accent
         self.trailingText = trailingText
+        self.isCollapsed = isCollapsed
+        self.onToggleCollapse = onToggleCollapse
         self.content = content()
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
+        VStack(alignment: .leading, spacing: isCollapsed ? 0 : 6) {
             HStack(spacing: 6) {
                 Image(systemName: icon)
                     .font(.system(size: 10.5, weight: .bold))
@@ -2018,8 +2111,20 @@ struct StudioCard<Content: View>: View {
                         .font(.system(size: 9.5, weight: .medium, design: .monospaced))
                         .foregroundColor(.secondary)
                 }
+
+                Image(systemName: isCollapsed ? "chevron.right" : "chevron.down")
+                    .font(.system(size: 9.5, weight: .bold))
+                    .foregroundColor(.secondary.opacity(0.85))
+                    .frame(width: 14, height: 14)
             }
-            content
+            .contentShape(Rectangle())
+            .onTapGesture {
+                onToggleCollapse()
+            }
+
+            if !isCollapsed {
+                content
+            }
         }
         .padding(9)
         .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.04)))
@@ -2036,11 +2141,7 @@ struct StudioPanelView: View {
     }
 
     var computedHeight: CGFloat {
-        if ctrl.miniMode { return 118 }
-        var h: CGFloat = 685
-        if ctrl.showPreview { h += 192 }
-        if ctrl.showLogs { h += 104 }
-        return h
+        return ctrl.targetWindowHeight
     }
 
     var body: some View {
@@ -2307,7 +2408,14 @@ struct StudioPanelView: View {
                 }
 
                 // CARD 1: OPTICS, PHYSICAL LENSES & AUTOFOCUS
-                StudioCard(title: ctrl.tr("1. Оптика Pixel 10 Pro, Кино-фиксы и Автофокус", "1. Pixel 10 Pro Optics, Cinema Primes & Autofocus"), icon: "camera.filters", accent: .blue, trailingText: ctrl.currentCameraFacing) {
+                StudioCard(
+                    title: ctrl.tr("1. Оптика Pixel 10 Pro, Кино-фиксы и Автофокус", "1. Pixel 10 Pro Optics, Cinema Primes & Autofocus"),
+                    icon: "camera.filters",
+                    accent: .blue,
+                    trailingText: ctrl.currentCameraFacing,
+                    isCollapsed: ctrl.collapsedCards.contains(1),
+                    onToggleCollapse: { ctrl.toggleCardCollapsed(1) }
+                ) {
                     VStack(spacing: 6) {
                         if !ctrl.pixelScreenUnlocked {
                             HStack(spacing: 6) {
@@ -2384,12 +2492,20 @@ struct StudioPanelView: View {
                             ))
                             .toggleStyle(.checkbox)
                             .font(.system(size: 10))
+                            .help(ctrl.tr("Затемнить OLED-экран Pixel (яркость и автояркость вернутся автоматически при снятии галочки, закрытии или отключении кабеля)", "Dim Pixel OLED screen (auto-restores exact brightness & Adaptive Brightness when unchecked, on quit, or on USB unplug)"))
                         }
                     }
                 }
 
                 // CARD 2: FRAMING, INTERACTIVE 2D PAD & APPLE VISION AI
-                StudioCard(title: ctrl.tr("2. Кадрирование, 2D-Трекпад & ИИ-Трекинг (Apple Vision)", "2. Framing, 2D Trackpad & AI Face Tracking (Apple Vision)"), icon: "viewfinder.circle.fill", accent: .purple, trailingText: String(format: "%.2fx • AI: %@", ctrl.zoomLevel, ctrl.aiFaceStatus)) {
+                StudioCard(
+                    title: ctrl.tr("2. Кадрирование, 2D-Трекпад & ИИ-Трекинг (Apple Vision)", "2. Framing, 2D Trackpad & AI Face Tracking (Apple Vision)"),
+                    icon: "viewfinder.circle.fill",
+                    accent: .purple,
+                    trailingText: String(format: "%.2fx • AI: %@", ctrl.zoomLevel, ctrl.aiFaceStatus),
+                    isCollapsed: ctrl.collapsedCards.contains(2),
+                    onToggleCollapse: { ctrl.toggleCardCollapsed(2) }
+                ) {
                     HStack(spacing: 10) {
                         VStack(spacing: 6) {
                             HStack(spacing: 6) {
@@ -2450,7 +2566,14 @@ struct StudioPanelView: View {
                 }
 
                 // CARD 3: 3D CINEMA LUT CARDS WITH COLOR SWATCHES & 2.35:1 SCOPE
-                StudioCard(title: ctrl.tr("3. Кинематографические 3D LUT и Анаморфотное Каше 2.35:1", "3. 3D Cinema LUTs & 2.35:1 Anamorphic Scope"), icon: "film.stack", accent: .orange, trailingText: "\(Int(ctrl.lutIntensity * 100))%") {
+                StudioCard(
+                    title: ctrl.tr("3. Кинематографические 3D LUT и Анаморфотное Каше 2.35:1", "3. 3D Cinema LUTs & 2.35:1 Anamorphic Scope"),
+                    icon: "film.stack",
+                    accent: .orange,
+                    trailingText: "\(Int(ctrl.lutIntensity * 100))%",
+                    isCollapsed: ctrl.collapsedCards.contains(3),
+                    onToggleCollapse: { ctrl.toggleCardCollapsed(3) }
+                ) {
                     VStack(spacing: 6) {
                         HStack(spacing: 5) {
                             lutCard(title: "S-Cinetone", sub: "Sony Alpha", id: "sony",
@@ -2512,7 +2635,13 @@ struct StudioPanelView: View {
                 }
 
                 // CARD 4: 2-COLUMN EXPOSURE, WHITE BALANCE & DETAIL MATRIX
-                StudioCard(title: ctrl.tr("4. Экспозиция, Баланс Белого (ББ) и Детализация", "4. Exposure, White Balance & Sharpening"), icon: "slider.horizontal.3", accent: .cyan) {
+                StudioCard(
+                    title: ctrl.tr("4. Экспозиция, Баланс Белого (ББ) и Детализация", "4. Exposure, White Balance & Sharpening"),
+                    icon: "slider.horizontal.3",
+                    accent: .cyan,
+                    isCollapsed: ctrl.collapsedCards.contains(4),
+                    onToggleCollapse: { ctrl.toggleCardCollapsed(4) }
+                ) {
                     VStack(spacing: 5) {
                         HStack(spacing: 6) {
                             Button(action: { ctrl.resetExposureAuto() }) {
@@ -2555,7 +2684,14 @@ struct StudioPanelView: View {
                 }
 
                 // CARD 5: RØDE NT1 5th Gen STUDIO AUDIO & HARDWARE LIP-SYNC
-                StudioCard(title: ctrl.tr("5. Аудио RØDE NT1 5th Gen (Родной APHEX DSP + Аппаратный Lip-Sync)", "5. RØDE NT1 5th Gen Audio (Native APHEX DSP + Hardware Lip-Sync)"), icon: "mic.fill", accent: .green, trailingText: "Lip-Sync: +\(Int(ctrl.rodeLipSyncMs)) ms") {
+                StudioCard(
+                    title: ctrl.tr("5. Аудио RØDE NT1 5th Gen (Родной APHEX DSP + Аппаратный Lip-Sync)", "5. RØDE NT1 5th Gen Audio (Native APHEX DSP + Hardware Lip-Sync)"),
+                    icon: "mic.fill",
+                    accent: .green,
+                    trailingText: "Lip-Sync: +\(Int(ctrl.rodeLipSyncMs)) ms",
+                    isCollapsed: ctrl.collapsedCards.contains(5),
+                    onToggleCollapse: { ctrl.toggleCardCollapsed(5) }
+                ) {
                     VStack(spacing: 5) {
                         HStack(spacing: 8) {
                             IsolatedVuMeterBar(
@@ -2718,7 +2854,7 @@ struct StudioPanelView: View {
             }
         }
         .padding(10)
-        .frame(width: 716, height: computedHeight)
+        .frame(width: 716, height: computedHeight, alignment: .top)
         .background(Color(red: 0.08, green: 0.09, blue: 0.12))
         .preferredColorScheme(.dark)
     }
@@ -2858,11 +2994,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         NSApp.appearance = NSAppearance(named: .darkAqua)
 
         let contentView = StudioPanelView(ctrl: ctrl)
-        var initH: CGFloat = ctrl.miniMode ? 118 : 685
-        if !ctrl.miniMode {
-            if ctrl.showPreview { initH += 192 }
-            if ctrl.showLogs { initH += 104 }
-        }
+        let initH: CGFloat = ctrl.targetWindowHeight
         window = FloatingStudioPanel(
             contentRect: NSRect(x: 0, y: 0, width: 716, height: initH),
             styleMask: [.titled, .closable, .miniaturizable, .resizable],
@@ -2970,15 +3102,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
             ctrl.savedWindowOrigin = win.frame.origin
         }
         ctrl.saveLastSetupNow()
+        ctrl.restorePixelBrightnessSyncIfBlackedOut()
     }
 
     func resizeWindowSmoothly() {
         guard let win = window else { return }
-        var targetH: CGFloat = ctrl.miniMode ? 118 : 685
-        if !ctrl.miniMode {
-            if ctrl.showPreview { targetH += 192 }
-            if ctrl.showLogs { targetH += 104 }
-        }
+        let targetH: CGFloat = ctrl.targetWindowHeight
         let currentFrame = win.frame
         let newContentRect = NSRect(x: 0, y: 0, width: 716, height: targetH)
         let newFrameSize = win.frameRect(forContentRect: newContentRect).size
@@ -3083,6 +3212,11 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
         letterboxItem.target = self
         letterboxItem.state = ctrl.letterboxEnabled ? .on : .off
         menu.addItem(letterboxItem)
+
+        let blackoutItem = NSMenuItem(title: ctrl.tr("🌙 OLED Blackout (Экран Pixel)", "🌙 OLED Blackout (Pixel Screen)"), action: #selector(menuToggleBlackout), keyEquivalent: "")
+        blackoutItem.target = self
+        blackoutItem.state = ctrl.isBlackoutEnabled ? .on : .off
+        menu.addItem(blackoutItem)
 
         menu.addItem(NSMenuItem.separator())
 
@@ -3217,6 +3351,7 @@ class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate, NSWindowDele
     @objc func menuToggleProMist() { ctrl.setProMist(!ctrl.proMistEnabled) }
     @objc func menuToggleFilmGrain() { ctrl.setFilmGrain(!ctrl.filmGrainEnabled) }
     @objc func menuToggleLetterbox() { ctrl.setCinemaLetterbox(!ctrl.letterboxEnabled) }
+    @objc func menuToggleBlackout() { ctrl.togglePixelBlackout(!ctrl.isBlackoutEnabled) }
     @objc func menuSet60Fps() { ctrl.setCameraFpsMode(use60Fps: true) }
     @objc func menuSet30Fps() { ctrl.setCameraFpsMode(use60Fps: false) }
     @objc func menuToggleAutoObs() { ctrl.toggleAutoStartObs(!ctrl.autoStartObsEnabled) }
